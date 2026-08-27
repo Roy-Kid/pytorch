@@ -399,7 +399,8 @@ def list_options() -> list[str]:
     r"""Returns a dictionary describing the optimizations and debug configurations
     that are available to `torch.compile()`.
 
-    The options are documented in `torch._inductor.config`.
+    The options are documented in `torch._inductor.config`. Options declared by
+    registered backends (see `register_backend_for_device`) are included as well.
 
     Example::
 
@@ -407,10 +408,11 @@ def list_options() -> list[str]:
     """
 
     from torch._inductor import config
+    from torch._inductor.codegen.common import list_compile_options
 
     current_config: dict[str, Any] = config.get_config_copy()
 
-    return list(current_config.keys())
+    return list(current_config.keys()) + list_compile_options()
 
 
 def cudagraph_mark_step_begin():

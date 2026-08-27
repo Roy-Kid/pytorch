@@ -111,6 +111,22 @@ Device modules that instead expose `Scheduling`, `PythonWrapperCodegen`, and
 the codegen classes eagerly at `import torch`. A device that is already registered
 (for example eagerly from `_autoload`) skips the hook entirely.
 
+A backend that keeps its options in a `ConfigModule` can expose them through
+`torch.compile(options=...)`: register the module as `device_custom_config` and map
+user-facing option names to keys in it. The values are patched onto the owning
+module for the duration of the compilation, instead of `torch._inductor.config`.
+
+```python
+register_backend_for_device(
+    "my_device",
+    MyScheduling,
+    MyWrapperCodegen,
+    MyCppWrapperCodegen,
+    device_custom_config=my_backend_config,
+    device_compile_options={"my_backend_option": "my_config_key"},
+)
+```
+
 ## Result
 
 After setting up the entry point and backend, build and install your backend. Now, we can use the new accelerator without explicitly importing it.
