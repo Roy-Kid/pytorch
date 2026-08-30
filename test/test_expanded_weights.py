@@ -963,7 +963,7 @@ class TestExpandedWeightModule(TestCase):
 class ContextManagerTests(TestBase):
     def __init__(self, *args, **kwargs):
         self.test_cpu = kwargs.get("test_cpu", True)
-        self.test_device = kwargs.get("test_device", True)
+        self.test_accelerator = kwargs.get("test_accelerator", True)
         super().__init__(*args, **kwargs)
 
     @property
@@ -1047,7 +1047,7 @@ for test_param in supported_tests:
                 )
             ),
         )
-    if TEST_ACCELERATOR and test.test_device:
+    if TEST_ACCELERATOR and test.test_accelerator:
         # since this checks derivatives, only use double for precision
         setattr(
             TestExpandedWeightModule,
