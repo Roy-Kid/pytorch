@@ -1080,11 +1080,36 @@ class AutocastModeVariable(ContextWrappingVariable):
         args: Sequence[Any],
         kwargs: dict[str, Any],
     ) -> "AutocastModeVariable":
+        from .torch import _is_privateuse1_autocast
+
         if not (
             isinstance(func, type)
             and issubclass(func, torch.amp.autocast_mode.autocast)
         ):
             raise AssertionError(f"unexpected autocast function: {func}")
+        if func not in [
+            torch.amp.autocast_mode.autocast,
+            torch.cuda.amp.autocast,
+            torch.cpu.amp.autocast,
+        ] and _is_privateuse1_autocast(func):
+            python_args = [
+                arg.as_python_constant() if isinstance(arg, VariableTracker) else arg
+                for arg in args
+            ]
+            python_kwargs = {
+                key: value.as_python_constant()
+                if isinstance(value, VariableTracker)
+                else value
+                for key, value in kwargs.items()
+            }
+            mode = func(*python_args, **python_kwargs)
+            target_values = [
+                mode.device,
+                mode.fast_dtype,
+                mode._enabled,
+                mode._cache_enabled,
+            ]
+            return AutocastModeVariable(target_values, initial_values=None)
         # device_type : str,
         # dtype : Optional[_dtype] = None,
         # enabled : bool = True,
@@ -1092,30 +1117,22 @@ class AutocastModeVariable(ContextWrappingVariable):
         bound_args = inspect.signature(func).bind(*args, **kwargs)
         bound_args.apply_defaults()
         target_values = []
-        kwargs.clear()
 
-        for key, default in [
-            ("device_type", None),
-            ("dtype", None),
-            ("enabled", True),
-            ("cache_enabled", None),
-        ]:
+        for key in ["device_type", "dtype", "enabled", "cache_enabled"]:
             if key == "device_type" and func in [
                 torch.cuda.amp.autocast,
                 torch.cpu.amp.autocast,
             ]:
                 # pyrefly: ignore [unnecessary-comparison]
                 arg = "cuda" if func is torch.cuda.amp.autocast else "cpu"
-            elif key == "device_type" and key not in bound_args.arguments:
-                arg = torch._C._get_privateuse1_backend_name()
             else:
-                arg = bound_args.arguments.get(key, default)
+                arg = bound_args.arguments[key]
             if isinstance(arg, VariableTracker):
                 target_values.append(arg.as_python_constant())
             else:
                 target_values.append(arg)
 
-        var = AutocastModeVariable(target_values, initial_values=None, **kwargs)
+        var = AutocastModeVariable(target_values, initial_values=None)
         return var
 
     def __init__(
