@@ -481,8 +481,7 @@ def skipIfDynamoInput(reason):
     return decorator
 
 
-class TestAOTAutograd(AOTTestCase):
-    hw_classification = HardwareClassification.GENERIC
+class _TestAOTAutogradBase(AOTTestCase):
 
     def run_autograd(
         self,
@@ -645,6 +644,10 @@ class TestAOTAutograd(AOTTestCase):
                 )
 
         return fw_graph_cell[0]
+
+
+class TestAOTAutograd(_TestAOTAutogradBase):
+    hw_classification = HardwareClassification.GENERIC
 
     def test_non_tensor_and_none_inputs(self):
         # int, None, Tensor
@@ -4887,7 +4890,7 @@ def forward(self, tangents_1):
         self.assertEqual(out.stride(), inp.stride())
 
 
-class TestAOTAutogradDevice(AOTTestCase):
+class TestAOTAutogradDevice(_TestAOTAutogradBase):
     hw_classification = HardwareClassification.ACCELERATOR
 
     def _compile_autocast(self, device, *, forward_autocast):
