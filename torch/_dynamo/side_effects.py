@@ -1955,13 +1955,16 @@ def _codegen_attribute_mutation(ctx: SideEffectReplayContext) -> None:
         mutation_kind = side_effects.get_attr_mutation_kind(var, name)
         if isinstance(var, variables.NewGlobalVariable):
             cg.tx.output.update_co_names(name)
-            cg(value)
             if not isinstance(var.source, GlobalSource):  # type: ignore[attr-defined]
                 raise AssertionError(
                     f"Expected GlobalSource for NewGlobalVariable, "
                     f"got {type(var.source)}"  # type: ignore[attr-defined]
                 )
-            ctx.suffixes.append([create_instruction("STORE_GLOBAL", argval=name)])
+            if isinstance(value, variables.DeletedVariable):
+                ctx.suffixes.append([create_instruction("DELETE_GLOBAL", argval=name)])
+            else:
+                cg(value)
+                ctx.suffixes.append([create_instruction("STORE_GLOBAL", argval=name)])
             side_effect_occurred = True
         elif isinstance(value, variables.DeletedVariable):
             if isinstance(var, variables.CellVariable):
@@ -1975,6 +1978,21 @@ def _codegen_attribute_mutation(ctx: SideEffectReplayContext) -> None:
                 cg(var.source)  # type: ignore[attr-defined]
                 ctx.suffixes.append(
                     [*create_call_function(1, False), create_instruction("POP_TOP")]
+                )
+                side_effect_occurred = True
+            elif (
+                isinstance(var, variables.PythonModuleVariable)
+                and mutation_kind is AttrMutationKind.GLOBAL_DELETE
+            ):
+                cg.add_push_null(
+                    lambda: cg.load_import_from(
+                        utils.__name__, "delete_global_from_module"
+                    )
+                )
+                cg(var.source)  # type: ignore[attr-defined]
+                cg(variables.ConstantVariable(name))
+                ctx.suffixes.append(
+                    [*create_call_function(2, False), create_instruction("POP_TOP")]
                 )
                 side_effect_occurred = True
             elif (

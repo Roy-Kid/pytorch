@@ -253,6 +253,74 @@ class TestGlobals(torch._dynamo.test_case.TestCase):
         fn(torch.ones(2, 2))
         self.assertFalse(mock_store_global_crossfile_inline.global_flag)
 
+    def test_delete_global(self):
+        global _dynamo_test_delete_global
+        try:
+            _dynamo_test_delete_global = 10
+
+            def fn(x):
+                global _dynamo_test_delete_global
+                del _dynamo_test_delete_global
+                return x + 1
+
+            x = torch.ones(2, 2)
+            opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+            self.assertEqual(opt_fn(x), x + 1)
+            self.assertNotIn("_dynamo_test_delete_global", globals())
+        finally:
+            globals().pop("_dynamo_test_delete_global", None)
+
+    def test_delete_missing_global(self):
+        name = "_dynamo_test_delete_missing_global"
+        globals().pop(name, None)
+
+        def fn():
+            global _dynamo_test_delete_missing_global
+            del _dynamo_test_delete_missing_global
+            return 1
+
+        with self.assertRaisesRegex(NameError, f"name '{name}' is not defined"):
+            torch.compile(fn, backend="eager", fullgraph=True)()
+
+    def test_delete_global_crossfile_inline(self):
+        try:
+            from . import mock_store_global_crossfile_inline
+        except ImportError:
+            import mock_store_global_crossfile_inline
+
+        mock_store_global_crossfile_inline.delete_global_value = True
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            mock_store_global_crossfile_inline.delete_global_value_fn()
+            return x + 1
+
+        fn(torch.ones(2, 2))
+        self.assertNotIn(
+            "delete_global_value",
+            mock_store_global_crossfile_inline.__dict__,
+        )
+
+    def test_delete_missing_global_crossfile_inline(self):
+        try:
+            from . import mock_store_global_crossfile_inline
+        except ImportError:
+            import mock_store_global_crossfile_inline
+
+        mock_store_global_crossfile_inline.__dict__.pop(
+            "delete_missing_global_value", None
+        )
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x):
+            mock_store_global_crossfile_inline.delete_missing_global_value_fn()
+            return x + 1
+
+        with self.assertRaisesRegex(
+            NameError, "name 'delete_missing_global_value' is not defined"
+        ):
+            fn(torch.ones(2, 2))
+
     def test_unregistered_importlib_module_globals(self):
         module_name = "test_dynamo_unregistered_module_181243"
         self.assertNotIn(module_name, sys.modules)

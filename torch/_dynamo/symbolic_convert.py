@@ -157,7 +157,13 @@ from .utils import (
     PySendResult,
     unpack_iterable,
 )
-from .variables.base import SourceLocation, typestr, ValueMutationNew, VariableTracker
+from .variables.base import (
+    AttrMutationKind,
+    SourceLocation,
+    typestr,
+    ValueMutationNew,
+    VariableTracker,
+)
 from .variables.builder import FrameStateSizeEntry, VariableBuilder, wrap_fx_proxy
 from .variables.builtin import BuiltinVariable, DictBuiltinVariable
 from .variables.constant import ConstantVariable
@@ -2411,6 +2417,18 @@ class InstructionTranslatorBase(
                 hints=[],
             )
         self.output.side_effects.store_global(variable, name, value)
+
+    def DELETE_GLOBAL(self, inst: Instruction) -> None:
+        name = inst.argval
+        source = GlobalSource(name)
+        if name not in self.symbolic_globals:
+            self.symbolic_globals[name] = object()  # type: ignore[assignment]  # sentinel object
+        variable = self.output.side_effects.track_global_existing(
+            source, self.symbolic_globals[name]
+        )
+        self.output.side_effects.store_global(
+            variable, name, variables.DeletedVariable()
+        )
 
     # Cache note: This cache only exists for the duration of this
     # InstructionTranslator - so it should be safe to do.
@@ -6523,6 +6541,30 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
                     hints=[*graph_break_hints.SUPPORTABLE],
                 )
             self.output.side_effects.store_attr(fglobals_vt, name, value)
+
+    def DELETE_GLOBAL(self, inst: Instruction) -> None:
+        if self.output.global_scope is self.f_globals:
+            return super().DELETE_GLOBAL(inst)
+        else:
+            name = inst.argval
+            _, fglobals_vt, global_source = self.get_globals_source_and_value(name)
+            if isinstance(global_source, DictGetItemSource):
+                unimplemented(
+                    gb_type="DELETE_GLOBAL in non-module globals",
+                    context=name,
+                    explanation=(
+                        "Dynamo cannot safely replay global deletes for an inlined "
+                        "function whose globals dict is not the registered module "
+                        "__dict__."
+                    ),
+                    hints=[*graph_break_hints.SUPPORTABLE],
+                )
+            self.output.side_effects.store_attr(
+                fglobals_vt,
+                name,
+                variables.DeletedVariable(),
+                mutation_kind=AttrMutationKind.GLOBAL_DELETE,
+            )
 
 
 class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):

@@ -4657,6 +4657,14 @@ def object_delattr_ignore_descriptor(obj: Any, name: str) -> None:
     del d[name]
 
 
+def delete_global_from_module(module: types.ModuleType, name: str) -> None:
+    """Replay DELETE_GLOBAL against a module's globals dict."""
+    try:
+        del module.__dict__[name]
+    except KeyError:
+        raise NameError(f"name '{name}' is not defined") from None
+
+
 def class_has_getattribute(cls: type) -> bool:
     try:
         if isinstance(
