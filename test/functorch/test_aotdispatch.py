@@ -11893,24 +11893,22 @@ Expected a .* tangent but got a plain Tensor.""",
 class TestAOTModuleSimplifiedDevice(AOTTestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    def test_rms_norm(self):
+    @onlyAccelerator
+    def test_rms_norm(self, device):
         # Only CUDA rms norm fails to be decomposed
         def fn(x):
             return F.rms_norm(x, normalized_shape=(8,))
 
-        x = torch.randn(2, 4, 8, device="cuda")
+        x = torch.randn(2, 4, 8, device=device)
         eager = fn(x)
         aot_eager = torch.compile(backend="aot_eager")(fn)(x)
         self.assertEqual(eager, aot_eager, atol=0, rtol=0)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     @parametrize("dynamic_shapes", [True, False])
     @parametrize("test_subclasses", [True, False])
-    @parametrize("device", ["cuda", "cpu"])
     @patch("torch._functorch.config.guess_tangent_strides_as_outputs", True)
     def test_noncontig_nonmemformat_tangents(
-        self, dynamic_shapes, test_subclasses, device
+        self, device, dynamic_shapes, test_subclasses
     ):
         B = 2
         T = 4
@@ -11974,9 +11972,9 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
 
             self.assertEqual(ref_x.grad, x.grad)
 
+    @onlyAccelerator
     @patch("torch._functorch.config.guess_tangent_strides_as_outputs", True)
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    def test_flex_attn_noncontiguous_tangents(self):
+    def test_flex_attn_noncontiguous_tangents(self, device):
         with GradsNoForceContiguousContextManager() as ctx:
             E = 16  # embedding dim
             H = 4  # number of heads
@@ -12003,12 +12001,12 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
 
                     return y.transpose(1, 2).contiguous().view(B, T, E)
 
-            m = M().cuda()
+            m = M().to(device)
             B = 1
             T = 8
 
             def _inp():
-                return torch.randn(B, T, E, requires_grad=True, device="cuda")
+                return torch.randn(B, T, E, requires_grad=True, device=device)
 
             x = _inp()
             y = m(x)
@@ -12080,10 +12078,10 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
             x_grad = pytree.tree_map_only(torch.Tensor, lambda t: t.grad, x)
             self.assertEqual(ref_x_grad, x_grad, atol=1e-2, rtol=1e-2)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
+    @onlyAccelerator
+    @skipCUDAIf(not SM80OrLater, "bfloat16, float8")
     @parametrize("saved_tensors_hooks_filtering_mode", ["donated", "no_static", "all"])
-    def test_saved_tensors_hooks_base(self, saved_tensors_hooks_filtering_mode):
+    def test_saved_tensors_hooks_base(self, device, saved_tensors_hooks_filtering_mode):
         with patch(
             "torch._functorch.config.saved_tensors_hooks_filtering_mode",
             saved_tensors_hooks_filtering_mode,
@@ -12129,8 +12127,6 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
                 x = x.t()
                 x = SAF.apply(x, y)
                 return x
-
-            device = torch.device("cuda:0")
 
             def inp_fn():
                 x = torch.ones(2, 2, device=device, requires_grad=True)
@@ -12231,9 +12227,9 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
                 #     test_fn, inp_fn, [(pack_wrapper_two_tensor, unpack_wrapper_two_tensor)]
                 # )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
-    def test_saved_tensors_hooks_params(self):
+    @onlyAccelerator
+    @skipCUDAIf(not SM80OrLater, "bfloat16, float8")
+    def test_saved_tensors_hooks_params(self, device):
         with torch.library._scoped_library("_test_aotdispatch_lib", "FRAGMENT") as lib:
             logged_shapes = []
             logged_dtypes = []
@@ -12247,7 +12243,7 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
             def log_meta(x):
                 return x.clone()
 
-            for backend in ["CPU", "CUDA"]:
+            for backend in ["CPU", "CUDA", "XPU"]:
                 lib.impl(
                     "log",
                     log_impl,
@@ -12300,7 +12296,6 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
                 logged_shapes.clear()
                 logged_dtypes.clear()
 
-            device = torch.device("cuda:0")
             m = M().to(device=device)
 
             def _test_m():
@@ -12354,10 +12349,10 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
                 self.assertTrue([2, 2, 2] in logged_shapes)
                 self.assertTrue(torch.float64 in logged_dtypes)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
+    @onlyAccelerator
+    @skipCUDAIf(not SM80OrLater, "bfloat16, float8")
     @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="all")
-    def test_saved_tensors_hooks_recompile(self):
+    def test_saved_tensors_hooks_recompile(self, device):
         ctx = torch.autograd.graph.saved_tensors_hooks
 
         def pack_bf16(x):
@@ -12403,8 +12398,6 @@ class TestAOTModuleSimplifiedDevice(AOTTestCase):
                 x = 2 * x
                 x = AF.apply(x)
                 return x
-
-            device = torch.device("cuda:0")
 
             def inp_fn():
                 x = torch.ones(2, 3, device=device, requires_grad=True)
