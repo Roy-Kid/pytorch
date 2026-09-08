@@ -5381,6 +5381,8 @@ class TestMod(torch.nn.Module):
 
 
 class TestAOTExport(AOTTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def setUp(self):
         super().setUp()
         torch._dynamo.reset()
