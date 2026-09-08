@@ -90,6 +90,7 @@ from torch.testing._internal.common_device_type import (
     ops,
     skipCUDAIf,
     skipOps,
+    skipXPUIf,
     tol,
     toleranceOverride,
 )
@@ -10187,6 +10188,7 @@ class TestPartitioningDevice(AOTTestCase):
     # --- FunctionalizedRngRuntimeWrapper codegen tests ---
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_functionalized_rng_codegen_emitted(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("functionalized_rng_wrapper") as captured:
@@ -10208,6 +10210,7 @@ class TestPartitioningDevice(AOTTestCase):
         self.assertIn("_set_offset_", source)
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_functionalized_rng_codegen_correctness(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
@@ -10223,6 +10226,7 @@ class TestPartitioningDevice(AOTTestCase):
         self.assertTrue((out >= 0).all() and (out <= 1).all())
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_functionalized_rng_codegen_multi_output(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
@@ -10238,6 +10242,7 @@ class TestPartitioningDevice(AOTTestCase):
         self.assertEqual(out1.shape, x.shape)
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_functionalized_rng_codegen_advances_state(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
@@ -10255,6 +10260,7 @@ class TestPartitioningDevice(AOTTestCase):
         )
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_functionalized_rng_codegen_source_structure(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("functionalized_rng_wrapper") as captured:
@@ -10272,6 +10278,7 @@ class TestPartitioningDevice(AOTTestCase):
         self.assertIn("outs[", source)
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_functionalized_rng_codegen_training(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
@@ -10290,6 +10297,7 @@ class TestPartitioningDevice(AOTTestCase):
     # --- Backward prologue codegen tests ---
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_backward_prologue_rng_codegen(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("backward_prologue") as captured:
@@ -10309,6 +10317,7 @@ class TestPartitioningDevice(AOTTestCase):
     # --- CompiledFunction.forward codegen tests ---
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/5255")
     def test_compiled_forward_rng_codegen(self, device):
         # _rng_add_ is emitted when num_graphsafe_rng_states > 0, which
         # requires recomputable RNG ops (e.g. from activation checkpointing).
@@ -10334,6 +10343,7 @@ class TestPartitioningDevice(AOTTestCase):
     # --- CompiledFunction.backward codegen tests ---
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/5255")
     def test_compiled_backward_rng_codegen(self, device):
         # _rng_add_ is emitted when num_graphsafe_rng_states > 0, which
         # requires recomputable RNG ops (e.g. from activation checkpointing),
@@ -10358,6 +10368,7 @@ class TestPartitioningDevice(AOTTestCase):
         self.assertIn("_rng_add_(_ctx_", source)
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_compiled_backward_rng_correctness(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
 
@@ -10373,6 +10384,7 @@ class TestPartitioningDevice(AOTTestCase):
     # --- Backward epilogue codegen tests ---
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_backward_epilogue_rng_codegen(self, device):
         with torch._functorch.config.patch(functionalize_rng_ops=True):
             with capture_codegen_source("backward_epilogue") as captured:
@@ -10390,6 +10402,7 @@ class TestPartitioningDevice(AOTTestCase):
         self.assertIn("_set_offset_", source)
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_backward_epilogue_rng_correctness(self, device):
         def f(x):
             return torch.rand_like(x) + x * 2
@@ -10413,6 +10426,7 @@ class TestPartitioningDevice(AOTTestCase):
         self.assertEqual(x.grad, x_ref.grad)
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_backward_epilogue_tokens_and_rng_codegen(self, device):
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
@@ -10454,6 +10468,7 @@ class TestPartitioningDevice(AOTTestCase):
             h2.destroy()
 
     @onlyAccelerator
+    @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1970")
     def test_backward_epilogue_tokens_and_rng_correctness(self, device):
         from torch._higher_order_ops.effects import _register_effectful_op
         from torch._library.effects import EffectType
@@ -10513,13 +10528,14 @@ class TestPartitioningDevice(AOTTestCase):
     def test_control_deps_mixed_fwd_bw_deps_e2e(self, device):
         """Forward compilation and backward must not crash when
         wait_stream's control_deps collects forward deps."""
+        device_type = torch.device(device).type
 
         def fn(x, w):
-            s1 = torch.cuda.Stream()
-            s1.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s1):
+            s1 = torch.get_device_module(device_type).Stream()
+            s1.wait_stream(torch.get_device_module(device_type).current_stream())
+            with torch.get_device_module(device_type).stream(s1):
                 h = x @ w
-            ev = torch.cuda.Event()
+            ev = torch.get_device_module(device_type).Event()
             ev.record(s1)
             ev.wait()
             return h
@@ -12748,7 +12764,9 @@ instantiate_device_type_tests(
     TestAOTAutogradDevice, globals(), only_for=("cuda", "xpu"), allow_xpu=True
 )
 
-instantiate_device_type_tests(TestPartitioningDevice, globals(), only_for=("cuda",))
+instantiate_device_type_tests(
+    TestPartitioningDevice, globals(), only_for=("cuda", "xpu"), allow_xpu=True
+)
 
 instantiate_parametrized_tests(TestAOTModuleSimplified)
 only_for = "cpu"
