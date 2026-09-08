@@ -6617,6 +6617,8 @@ def forward(self, primals, tangents):
 
 
 class TestPartitioning(AOTTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @unittest.skipIf(not USE_NETWORKX, "networkx not available")
     def test_recompute_partitioning(self):
         def fn(a, b):
