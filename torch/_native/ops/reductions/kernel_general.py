@@ -292,9 +292,20 @@ def _try_fast_row(trait, trait_key, x, out_dtypes, nouts):
     # order, so a narrow row returned the default order's bits while the gate claimed ATen's --
     # MEASURED as differing bits at (524288, 16) and (524288, 128) through the aten entry point,
     # and invisible to the golden-hash test, which calls the fold directly.
-    if rt.narrow_row(N, x.element_size(), x.shape[0]):
+    if (
+        rt.narrow_row(N, x.element_size(), x.shape[0])
+        and not rt.inner_tree_order_enabled()
+    ):
         return rt.reduce_row_tile(trait, trait_key, x, out_dtypes, nouts=nouts, tpr=1)
     if _oneshot_ok(x):
+        return rt.reduce_row_tile(trait, trait_key, x, out_dtypes, nouts=nouts)
+    # Same rule one branch lower: kernel_xcta builds its own TileReduce at the default order and
+    # never consults the gate, so every shape past the one-shot came back with the wrong order
+    # (differing bits at (64, 100000), (8, 200000), (8, 1000000)). The `is not None` test predicts
+    # exactly what the fold's own gate will honour, so routing there cannot silently downgrade.
+    if rt.inner_tree_order_enabled() and (
+        rt.itree_plan(N, x.shape[0], x.element_size()) is not None
+    ):
         return rt.reduce_row_tile(trait, trait_key, x, out_dtypes, nouts=nouts)
     from . import kernel_xcta as xc
 
