@@ -112,7 +112,9 @@ class FusedTwoStage:
         # fold is ROLLED, so the sub-row length arrives as runtime args and a vec class shares one
         # kernel. No TMA atom: a sub-row here is wide enough that the direct load already coalesces.
         # The other axes' args are None, since an unused Int32 param is not free. ---
-        s1.kernel([mX], parts, s1_nchunks, s1_nwaves, project_n, None, None).launch(
+        s1.kernel(
+            [mX], parts, None, s1_nchunks, s1_nwaves, project_n, None, None
+        ).launch(
             grid=[cute.ceil_div(mX.shape[0], const_expr(s1.rows_per_block)), 1, 1],
             block=[const_expr(s1.nt), 1, 1],
             stream=stream,

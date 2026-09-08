@@ -482,6 +482,16 @@ def _try_fast_row(trait, trait_key, x, out_dtypes, nouts):
         return None
     from . import kernel_rowtile as rt
 
+    # NARROW rows first: packed onto a row, threads_per_row floors at one WARP, so a row narrower
+    # than WARP vec-chunks leaves most of each warp idle (25% at N=32). tpr=1 needs no merge.
+    #
+    # NOT when the reproducible order is on: tpr is a LAUNCH-SHAPE preference and the order
+    # supersedes those, deriving its own thread map from N. Passing tpr made the fold decline the
+    # order, so a narrow row returned the default order's bits while the gate claimed ATen's --
+    # MEASURED as differing bits at (524288, 16) and (524288, 128) through the aten entry point,
+    # and invisible to the golden-hash test, which calls the fold directly.
+    if rt.narrow_row(N, x.element_size(), x.shape[0]):
+        return rt.reduce_row_tile(trait, trait_key, x, out_dtypes, nouts=nouts, tpr=1)
     if _oneshot_ok(x):
         return rt.reduce_row_tile(trait, trait_key, x, out_dtypes, nouts=nouts)
     from . import kernel_xcta as xc

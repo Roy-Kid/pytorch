@@ -1,6 +1,7 @@
 # ROW reductions: the launch policy for tile.TileReduce on the row axis. The body is in
 # tile.py; this module owns the measured launch shapes, the narrow-row gates and the plan
 # cache. The chunk loop is ROLLED, so one compiled kernel covers every N in a vec class.
+
 import math
 from typing import NamedTuple
 
@@ -33,6 +34,52 @@ _NT_SMALL, _NT_LARGE, _NT_GATE_N = 128, 256, 16 * 1024
 # Wide-row rung: past 16 KB a row needs the full 256 threads, which the dtype-blind element
 # ladder under-threads (1.1-1.4x). In BYTES, so it is dtype-correct with no per-dtype table.
 _WIDE_ROW_BYTES = 16 * 1024
+
+
+# --- NARROW rows: tpr == 1 --- `tpr` floors at a WARP wherever lanes are merged, so a narrow
+# row leaves most of each warp idle (the packed shape measured 4.0x slower at (1048576, 32)).
+# tpr == 1 merges nothing, so it serves any trait. The width ceiling is derived from
+# MAX_UNROLL, since the whole row is one thread's unroll, and sits far above the crossover.
+_MAX_NARROW_N = min(256, tile.MAX_UNROLL)
+# MEASURED ladder of (minimum rows, per-thread chunk budget): one thread per row shrinks the
+# grid ~tpr times, so it needs enough rows to fill the SMs, and more of them the wider the
+# row. In vec-CHUNKS so it carries across dtypes. Tiered because one bound cannot serve both
+# ends -- 1.14-1.87x at M=4096, up to 33.7x at M=262144.
+_CHUNK_LADDER = ((65536, 32), (16384, 16), (4096, 6))
+
+# TMA-STAGED LOAD, for the one regime the direct load cannot reach SOL: thread t reads row t,
+# so the lane stride is a whole row and the direct load only holds 91-93% of peak while two
+# lanes share a 128-byte line (7001 GB/s at N=16 against 4584 at N=32). It is OVER-FETCH, so
+# the fix is a contiguous access, which a TMA box is. Worth 1.49-1.86x, but ONLY with the smem
+# rotation -- without it a regression -- so it is gated to the po2 fp32 N that mask assumes.
+_TMA_MIN_STRIDE = 128
+
+
+def narrow_row(N: int, itemsize: int, M: int) -> bool:
+    """Is this geometry in the regime where one thread per row beats the packed shape?"""
+    if N < 1 or N > _MAX_NARROW_N:
+        return False
+    chunks = N // tile.vec_size(N, itemsize)
+    for min_rows, budget in _CHUNK_LADDER:
+        if M >= min_rows:
+            return chunks <= budget
+    return False
+
+
+def tma_ok(N: int, itemsize: int, M: int, device=None) -> bool:
+    """Should this geometry stage its load through TMA rather than load direct?"""
+    if itemsize != 4 or N <= 0 or N & (N - 1) or N * itemsize < _TMA_MIN_STRIDE:
+        return False
+    if not narrow_row(N, itemsize, M):
+        return False
+    if device is not None:
+        # Through the memoized caps: this is evaluated on EVERY launch of the band, ahead of the
+        # plan-cache lookup, and the raw device query costs ~1.3us.
+        from .._cutedsl import hw_caps as _hw
+
+        if _hw.caps(device).cc[0] < 9:
+            return False  # TMA is sm_90+
+    return True
 
 
 class _RowConfig(NamedTuple):
@@ -82,6 +129,7 @@ def reduce_row_tile(
     nt=None,
     final=True,
     unroll=None,
+    use_tma=None,
 ):
     """Tile-based row reduction: reduce the contiguous last dim of a 2D `x` -> (M,).
 
@@ -100,6 +148,8 @@ def reduce_row_tile(
     tpr = max(WARP, cfg.tpr) if tpr is None else tpr
     nt = max(tpr, cfg.nt) if nt is None else nt
     nt -= nt % tpr  # rows_per_block must be whole
+    if use_tma is None:
+        use_tma = tpr == 1 and tma_ok(N, x.element_size(), M, x.device)
     dt = torch2cute[x.dtype]
     op = tile.TileReduce(
         trait,
@@ -111,6 +161,7 @@ def reduce_row_tile(
         nouts=nouts,
         final=final,
         unroll=unroll,
+        use_tma=use_tma,
     )
 
     # final -> nouts projected results; stage 1 -> one RAW partial buffer per trait field
@@ -122,19 +173,16 @@ def reduce_row_tile(
     # derivation so it cannot be forgotten here (it was, and cost 3x). The rolled paths take N at
     # RUNTIME, wrapping with both extents dynamic so one kernel serves a vec class; the TMA box
     # shape is compile-time, so that variant bakes N.
-    align = tile.align_bytes(N, x.element_size())
+    isz = x.element_size()
+    align = op.tilemap.align_bytes(isz) if use_tma else tile.align_bytes(N, isz)
 
     def _fake():
-        # Compile-time descriptors: 2D row-major with both extents dynamic, the inner one divisible by
-        # vec so one kernel serves the vec class. `align` is what keeps the load wide, narrowed to what
-        # the base pointer meets. The col axis's args are None, not dummies -- an unused Int32 param
-        # costs real time.
+        # Compile-time descriptors: 2D row-major, both extents dynamic (the inner one divisible by
+        # vec, so one kernel serves the vec class) EXCEPT under TMA, whose descriptor is static.
+        # The col axis's args are None rather than dummies -- an unused Int32 param costs real time.
+        inner = N if use_tma else _L.sym(op.vec)
         return (
-            [
-                _L.fake_compact(
-                    dt, (_L.sym(), _L.sym(op.vec)), order=(1, 0), align=align
-                )
-            ],
+            [_L.fake_compact(dt, (_L.sym(), inner), order=(1, 0), align=align)],
             [_L.fake_compact(torch2cute[o.dtype], (_L.sym(),)) for o in outs],
             nchunks,
             nwaves,
