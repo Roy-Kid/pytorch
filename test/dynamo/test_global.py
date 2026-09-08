@@ -282,6 +282,37 @@ class TestGlobals(torch._dynamo.test_case.TestCase):
         with self.assertRaisesRegex(NameError, f"name '{name}' is not defined"):
             torch.compile(fn, backend="eager", fullgraph=True)()
 
+    def test_delete_missing_global_caught(self):
+        name = "_dynamo_test_delete_missing_global_caught"
+        globals().pop(name, None)
+
+        def fn(x):
+            global _dynamo_test_delete_missing_global_caught
+            try:
+                del _dynamo_test_delete_missing_global_caught
+            except NameError:
+                pass
+            return x + 1
+
+        x = torch.ones(2, 2)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(opt_fn(x), x + 1)
+
+    def test_delete_global_created_then_deleted(self):
+        name = "_dynamo_test_delete_global_created_then_deleted"
+        globals().pop(name, None)
+
+        def fn(x):
+            global _dynamo_test_delete_global_created_then_deleted
+            _dynamo_test_delete_global_created_then_deleted = 1
+            del _dynamo_test_delete_global_created_then_deleted
+            return x + 1
+
+        x = torch.ones(2, 2)
+        opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
+        self.assertEqual(opt_fn(x), x + 1)
+        self.assertNotIn(name, globals())
+
     def test_delete_global_crossfile_inline(self):
         try:
             from . import mock_store_global_crossfile_inline
@@ -290,16 +321,20 @@ class TestGlobals(torch._dynamo.test_case.TestCase):
 
         mock_store_global_crossfile_inline.delete_global_value = True
 
-        @torch.compile(backend="eager", fullgraph=True)
-        def fn(x):
-            mock_store_global_crossfile_inline.delete_global_value_fn()
-            return x + 1
+        try:
 
-        fn(torch.ones(2, 2))
-        self.assertNotIn(
-            "delete_global_value",
-            mock_store_global_crossfile_inline.__dict__,
-        )
+            @torch.compile(backend="eager", fullgraph=True)
+            def fn(x):
+                mock_store_global_crossfile_inline.delete_global_value_fn()
+                return x + 1
+
+            fn(torch.ones(2, 2))
+            self.assertNotIn(
+                "delete_global_value",
+                mock_store_global_crossfile_inline.__dict__,
+            )
+        finally:
+            mock_store_global_crossfile_inline.delete_global_value = True
 
     def test_delete_missing_global_crossfile_inline(self):
         try:
@@ -399,6 +434,49 @@ fn = functools.partial(my_fn, scale=2)
             compiled = torch.compile(mod.fn, backend="eager")
             self.assertTrue(same(compiled(x), x + 2))
             self.assertEqual(mod.flag, 2)
+
+    def test_delete_global_in_unregistered_importlib_module(self):
+        module_name = "test_dynamo_unregistered_delete_global_181243"
+        self.assertNotIn(module_name, sys.modules)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module_path = os.path.join(tmpdir, f"{module_name}.py")
+            with open(module_path, "w") as f:
+                f.write(
+                    """
+import functools
+
+
+flag = 1
+
+
+def my_fn(x):
+    global flag
+    del flag
+    return x + 1
+
+
+fn = functools.partial(my_fn)
+"""
+                )
+
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.assertNotIn(module_name, sys.modules)
+
+            x = torch.randn(4, 4)
+            with self.assertRaisesRegex(
+                Unsupported, "DELETE_GLOBAL in non-module globals"
+            ):
+                torch.compile(mod.fn, backend="eager", fullgraph=True)(x)
+
+            mod.flag = 1
+            compiled = torch.compile(mod.fn, backend="eager")
+            self.assertTrue(same(compiled(x), x + 1))
+            self.assertNotIn("flag", mod.__dict__)
 
 
 if __name__ == "__main__":

@@ -2421,11 +2421,25 @@ class InstructionTranslatorBase(
     def DELETE_GLOBAL(self, inst: Instruction) -> None:
         name = inst.argval
         source = GlobalSource(name)
-        if name not in self.symbolic_globals:
-            self.symbolic_globals[name] = object()  # type: ignore[assignment]  # sentinel object
-        variable = self.output.side_effects.track_global_existing(
-            source, self.symbolic_globals[name]
-        )
+        if name not in self.f_globals and name not in self.symbolic_globals:
+            if sys.version_info >= (3, 11):
+                in_exception_handler = inst.exn_tab_entry is not None
+            else:
+                in_exception_handler = bool(self.block_stack)
+            if in_exception_handler:
+                raise_observed_exception(
+                    NameError,
+                    self,
+                    args=[f"name '{name}' is not defined"],
+                    kwargs={"name": ConstantVariable.create(name)},
+                )
+            variable = self.output.side_effects.track_global_existing(source, object())
+        else:
+            if name not in self.symbolic_globals:
+                self.symbolic_globals[name] = object()  # type: ignore[assignment]  # sentinel object
+            variable = self.output.side_effects.track_global_existing(
+                source, self.symbolic_globals[name]
+            )
         self.output.side_effects.store_global(
             variable, name, variables.DeletedVariable()
         )
@@ -6544,27 +6558,49 @@ class InliningInstructionTranslator(InstructionTranslatorBase):
 
     def DELETE_GLOBAL(self, inst: Instruction) -> None:
         if self.output.global_scope is self.f_globals:
-            return super().DELETE_GLOBAL(inst)
-        else:
-            name = inst.argval
-            _, fglobals_vt, global_source = self.get_globals_source_and_value(name)
-            if isinstance(global_source, DictGetItemSource):
-                unimplemented(
-                    gb_type="DELETE_GLOBAL in non-module globals",
-                    context=name,
-                    explanation=(
-                        "Dynamo cannot safely replay global deletes for an inlined "
-                        "function whose globals dict is not the registered module "
-                        "__dict__."
-                    ),
-                    hints=[*graph_break_hints.SUPPORTABLE],
-                )
-            self.output.side_effects.store_attr(
-                fglobals_vt,
-                name,
-                variables.DeletedVariable(),
-                mutation_kind=AttrMutationKind.GLOBAL_DELETE,
+            super().DELETE_GLOBAL(inst)
+            return
+        name = inst.argval
+        side_effects = self.output.side_effects
+        _, fglobals_vt, global_source = self.get_globals_source_and_value(name)
+        if isinstance(global_source, DictGetItemSource):
+            unimplemented(
+                gb_type="DELETE_GLOBAL in non-module globals",
+                context=name,
+                explanation=(
+                    "Dynamo cannot safely replay global deletes for an inlined "
+                    "function whose globals dict is not the registered module "
+                    "__dict__."
+                ),
+                hints=[*graph_break_hints.SUPPORTABLE],
             )
+        if name not in self.f_globals:
+            if side_effects.has_pending_mutation_of_attr(fglobals_vt, name):
+                value = side_effects.store_attr_mutations[fglobals_vt][name]
+                if not isinstance(value, variables.DeletedVariable):
+                    # STORE_GLOBAL created this name only during tracing, so the
+                    # delete nullifies the pending store and there is nothing to
+                    # replay against the real module dict.
+                    del side_effects.store_attr_mutations[fglobals_vt][name]
+                    del side_effects.attr_mutation_kinds[fglobals_vt][name]
+                    return
+            if sys.version_info >= (3, 11):
+                in_exception_handler = inst.exn_tab_entry is not None
+            else:
+                in_exception_handler = bool(self.block_stack)
+            if in_exception_handler:
+                raise_observed_exception(
+                    NameError,
+                    self,
+                    args=[f"name '{name}' is not defined"],
+                    kwargs={"name": ConstantVariable.create(name)},
+                )
+        side_effects.store_attr(
+            fglobals_vt,
+            name,
+            variables.DeletedVariable(),
+            mutation_kind=AttrMutationKind.GLOBAL_DELETE,
+        )
 
 
 class InliningGeneratorInstructionTranslator(InliningInstructionTranslator):

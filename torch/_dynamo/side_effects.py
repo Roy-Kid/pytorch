@@ -991,6 +991,8 @@ class SideEffects:
         return variable
 
     def track_global_existing(self, source: Source, item: object) -> VariableTracker:
+        if id(item) in self.id_to_variable:
+            return self.id_to_variable[id(item)]
         variable = variables.NewGlobalVariable(
             mutation_type=AttributeMutationExisting(),
             source=source,
@@ -1961,11 +1963,15 @@ def _codegen_attribute_mutation(ctx: SideEffectReplayContext) -> None:
                     f"got {type(var.source)}"  # type: ignore[attr-defined]
                 )
             if isinstance(value, variables.DeletedVariable):
-                ctx.suffixes.append([create_instruction("DELETE_GLOBAL", argval=name)])
+                if name in cg.tx.f_globals or name not in cg.tx.symbolic_globals:
+                    ctx.suffixes.append(
+                        [create_instruction("DELETE_GLOBAL", argval=name)]
+                    )
+                    side_effect_occurred = True
             else:
                 cg(value)
                 ctx.suffixes.append([create_instruction("STORE_GLOBAL", argval=name)])
-            side_effect_occurred = True
+                side_effect_occurred = True
         elif isinstance(value, variables.DeletedVariable):
             if isinstance(var, variables.CellVariable):
                 # Cells created during inlining (no local_name) are rebuilt via
