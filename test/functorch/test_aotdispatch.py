@@ -12792,6 +12792,8 @@ class TestAOTAutogradWithDynamo(TestAOTAutograd):
     These are the same as TestAOTAutograd tests, but we run dynamo first to get a graph module.
     """
 
+    hw_classification = HardwareClassification.GENERIC
+
     def assertExpectedInline(self, *args, **kwargs):
         # These will have different outputs because dynamo returns a different graph module
         # But we don't really care about that assertion when testing with dynamo,
@@ -13064,6 +13066,8 @@ class TestAOTAutogradWithCache(TestAOTAutogradWithDynamo):
     """
     In memory version of FXGraphCache so we can isolate testing for FXGraphCache
     """
+
+    hw_classification = HardwareClassification.GENERIC
 
     def make_compiler(self, fw_graph_cell):
         mock_inductor_cache = self.inductor_cache
