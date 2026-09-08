@@ -12671,26 +12671,28 @@ def _test_aot_autograd_module_helper(
 
 
 class TestEagerFusionOpInfo(AOTTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @ops(op_db + hop_db, allowed_dtypes=(torch.float,))
     @skipOps(aot_autograd_failures)
-    def test_aot_autograd_exhaustive(self, device, dtype, op):
-        _test_aot_autograd_helper(self, device, dtype, op)
+    def test_aot_autograd_exhaustive(self, dtype, op):
+        _test_aot_autograd_helper(self, "cpu", dtype, op)
 
     @ops(op_db + hop_db, allowed_dtypes=(torch.float,))
     @patch("functorch.compile.config.debug_assert", True)
     @skipOps(
         aot_autograd_failures | symbolic_aot_autograd_failures,
     )
-    def test_aot_autograd_symbolic_exhaustive(self, device, dtype, op):
-        _test_aot_autograd_helper(self, device, dtype, op, dynamic=True)
+    def test_aot_autograd_symbolic_exhaustive(self, dtype, op):
+        _test_aot_autograd_helper(self, "cpu", dtype, op, dynamic=True)
 
     @ops(op_db + hop_db, allowed_dtypes=(torch.float,))
     @skipOps(
         aot_autograd_failures,
     )
-    def test_aot_autograd_disable_functionalization_exhaustive(self, device, dtype, op):
+    def test_aot_autograd_disable_functionalization_exhaustive(self, dtype, op):
         _test_aot_autograd_helper(
-            self, device, dtype, op, disable_functionalization=True
+            self, "cpu", dtype, op, disable_functionalization=True
         )
 
     @ops(op_db + hop_db, allowed_dtypes=(torch.float,))
@@ -12699,11 +12701,11 @@ class TestEagerFusionOpInfo(AOTTestCase):
         aot_autograd_failures | symbolic_aot_autograd_failures,
     )
     def test_aot_autograd_disable_functionalization_symbolic_exhaustive(
-        self, device, dtype, op
+        self, dtype, op
     ):
         _test_aot_autograd_helper(
             self,
-            device,
+            "cpu",
             dtype,
             op,
             dynamic=True,
@@ -12774,9 +12776,8 @@ instantiate_device_type_tests(
     TestAOTModuleSimplifiedDevice, globals(), only_for=("cuda", "xpu"), allow_xpu=True
 )
 
-only_for = "cpu"
-instantiate_device_type_tests(TestEagerFusionOpInfo, globals(), only_for=only_for)
-instantiate_device_type_tests(TestEagerFusionModuleInfo, globals(), only_for=only_for)
+instantiate_device_type_tests(TestEagerFusionOpInfo, globals(), only_for="cpu")
+instantiate_device_type_tests(TestEagerFusionModuleInfo, globals(), only_for="cpu")
 
 
 @xfail_inherited_tests(
