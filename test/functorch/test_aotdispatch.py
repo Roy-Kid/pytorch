@@ -11674,17 +11674,6 @@ Expected a .* tangent but got a plain Tensor.""",
         aot_eager = torch.compile(backend="aot_eager")(fn)(x)
         self.assertEqual(eager, aot_eager, atol=0, rtol=0)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    def test_rms_norm(self):
-        # Only CUDA rms norm fails to be decomposed
-        def fn(x):
-            return F.rms_norm(x, normalized_shape=(8,))
-
-        x = torch.randn(2, 4, 8, device="cuda")
-        eager = fn(x)
-        aot_eager = torch.compile(backend="aot_eager")(fn)(x)
-        self.assertEqual(eager, aot_eager, atol=0, rtol=0)
-
     def test_subclass_parameters(self):
         class _M(torch.nn.Module):
             def __init__(self):
@@ -11848,6 +11837,72 @@ Expected a .* tangent but got a plain Tensor.""",
         ref_y.backward(ref_grad)
         y.backward(grad)
         self.assertEqual(ref_x.grad, x.grad)
+
+    @torch._functorch.config.patch(donated_buffer=True)
+    @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="no_static")
+    def test_saved_tensors_hooks_donated_buffers(self):
+        pack_gm, unpack_gm = saved_tensors_hooks_to_gm(
+            pack_fp8,
+            unpack_fp8,
+            "pack_hash",
+            "unpack_hash",
+        )
+        logger_name = "torch._functorch._aot_autograd.graph_compile"
+
+        class SAF(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                ctx.save_for_backward(x)
+                return x
+
+            @staticmethod
+            def backward(ctx, gx):
+                (saved_x,) = ctx.saved_tensors
+                return gx + saved_x
+
+        def fn(x):
+            x0 = x
+            x = SAF.apply(x)
+            return x0, torch.nn.functional.relu(x)
+
+        inp = torch.rand([3, 3], requires_grad=True)
+        # 1. No donated buffers without hooks, as relu saves input which is also user output.
+        with self.assertLogs(logger_name, level="INFO") as captured:
+            out = torch.compile(fn, backend="aot_eager", fullgraph=True, dynamic=False)(
+                inp
+            )
+            out[1].sum().backward()
+            expected_msg = "bw_donated_idxs=[]"
+
+        FileCheck().check(expected_msg).run("\n".join(captured.output))
+
+        # 2. Hooks applied for all saved, as we set saved_tensors_hooks_no_filtering=True
+        # Results of the hooks become donated buffers.
+        inp = torch.rand([3, 3], requires_grad=True)
+        with torch.autograd.graph.saved_tensors_hooks(pack_gm, unpack_gm):
+            with self.assertLogs(logger_name, level="INFO") as captured:
+                out = torch.compile(
+                    fn, backend="aot_eager", fullgraph=True, dynamic=False
+                )(inp)
+                out[1].sum().backward()
+                expected_msg = "bw_donated_idxs=[0, 1]"
+
+        FileCheck().check(expected_msg).run("\n".join(captured.output))
+
+
+class TestAOTModuleSimplifiedDevice(AOTTestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    def test_rms_norm(self):
+        # Only CUDA rms norm fails to be decomposed
+        def fn(x):
+            return F.rms_norm(x, normalized_shape=(8,))
+
+        x = torch.randn(2, 4, 8, device="cuda")
+        eager = fn(x)
+        aot_eager = torch.compile(backend="aot_eager")(fn)(x)
+        self.assertEqual(eager, aot_eager, atol=0, rtol=0)
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
     @parametrize("dynamic_shapes", [True, False])
@@ -12397,57 +12452,6 @@ Expected a .* tangent but got a plain Tensor.""",
             expected_compile_count=3,
         )
 
-    @torch._functorch.config.patch(donated_buffer=True)
-    @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="no_static")
-    def test_saved_tensors_hooks_donated_buffers(self):
-        pack_gm, unpack_gm = saved_tensors_hooks_to_gm(
-            pack_fp8,
-            unpack_fp8,
-            "pack_hash",
-            "unpack_hash",
-        )
-        logger_name = "torch._functorch._aot_autograd.graph_compile"
-
-        class SAF(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, x):
-                ctx.save_for_backward(x)
-                return x
-
-            @staticmethod
-            def backward(ctx, gx):
-                (saved_x,) = ctx.saved_tensors
-                return gx + saved_x
-
-        def fn(x):
-            x0 = x
-            x = SAF.apply(x)
-            return x0, torch.nn.functional.relu(x)
-
-        inp = torch.rand([3, 3], requires_grad=True)
-        # 1. No donated buffers without hooks, as relu saves input which is also user output.
-        with self.assertLogs(logger_name, level="INFO") as captured:
-            out = torch.compile(fn, backend="aot_eager", fullgraph=True, dynamic=False)(
-                inp
-            )
-            out[1].sum().backward()
-            expected_msg = "bw_donated_idxs=[]"
-
-        FileCheck().check(expected_msg).run("\n".join(captured.output))
-
-        # 2. Hooks applied for all saved, as we set saved_tensors_hooks_no_filtering=True
-        # Results of the hooks become donated buffers.
-        inp = torch.rand([3, 3], requires_grad=True)
-        with torch.autograd.graph.saved_tensors_hooks(pack_gm, unpack_gm):
-            with self.assertLogs(logger_name, level="INFO") as captured:
-                out = torch.compile(
-                    fn, backend="aot_eager", fullgraph=True, dynamic=False
-                )(inp)
-                out[1].sum().backward()
-                expected_msg = "bw_donated_idxs=[0, 1]"
-
-        FileCheck().check(expected_msg).run("\n".join(captured.output))
-
 
 # entries in here don't work and need to be fixed.
 # Each one of these is a bug (or needs to be investigated)
@@ -12773,6 +12777,8 @@ instantiate_device_type_tests(
 )
 
 instantiate_parametrized_tests(TestAOTModuleSimplified)
+instantiate_device_type_tests(TestAOTModuleSimplifiedDevice, globals(), only_for=("cuda",))
+
 only_for = "cpu"
 instantiate_device_type_tests(TestEagerFusionOpInfo, globals(), only_for=only_for)
 instantiate_device_type_tests(TestEagerFusionModuleInfo, globals(), only_for=only_for)
