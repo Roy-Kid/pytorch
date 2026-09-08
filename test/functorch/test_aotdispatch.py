@@ -12744,10 +12744,12 @@ symbolic_aot_autograd_module_failures = {
 
 
 class TestEagerFusionModuleInfo(AOTTestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     @modules(module_db, allowed_dtypes=(torch.float,))
     @decorateForModules(unittest.expectedFailure, aot_autograd_module_failures)
-    def test_aot_autograd_module_exhaustive(self, device, dtype, training, module_info):
-        _test_aot_autograd_module_helper(self, device, dtype, training, module_info)
+    def test_aot_autograd_module_exhaustive(self, dtype, training, module_info):
+        _test_aot_autograd_module_helper(self, "cpu", dtype, training, module_info)
 
     @modules(module_db, allowed_dtypes=(torch.float,))
     @decorateForModules(
@@ -12755,10 +12757,10 @@ class TestEagerFusionModuleInfo(AOTTestCase):
         aot_autograd_module_failures | symbolic_aot_autograd_module_failures,
     )
     def test_aot_autograd_symbolic_module_exhaustive(
-        self, device, dtype, training, module_info
+        self, dtype, training, module_info
     ):
         _test_aot_autograd_module_helper(
-            self, device, dtype, training, module_info, dynamic=True
+            self, "cpu", dtype, training, module_info, dynamic=True
         )
 
 
