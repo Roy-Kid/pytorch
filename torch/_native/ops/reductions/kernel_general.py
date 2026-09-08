@@ -400,11 +400,51 @@ def fast_kind(red_pairs, kept_pairs, nouts, has_index):
     return None
 
 
+# The one-shot stages a whole row tile (~N*itemsize), so it must fit smem; above that the
+# multi-CTA split caps each chunk's tile. Conservative, to leave the reduction buffer room.
+_SMEM_BUDGET = 192 * 1024
+# ... and the per-thread LOAD count must stay bounded. It only runs away when the vector
+# width collapses to 1 (an odd or prime N): measured 0.08-0.17x of ATen with no bound, and
+# 1.93-2.41x once the cross-CTA split serves those instead. 64 separates every measured good
+# case from every bad one. tile.MAX_UNROLL bounds the same quantity inside the kernel.
+_ONESHOT_MAX_LOADS = 64
+
 # The general axis's launch config as named DATA. It is the any-geometry backstop rather than
 # a perf path, so these are occupancy baselines and not a tuned surface.
 _K0_BLOCK = 128
 _K0_ALL_BLOCK = 256
 _K0_ALL_GRID_MULT = 4
+
+
+def _oneshot_ok(x):
+    # One-shot: does the row fit its tile (~N elements of the input dtype) AND stay inside
+    # the per-thread load bound?
+    N = x.shape[-1]
+    if N * x.element_size() > _SMEM_BUDGET:
+        return False
+    from . import kernel_rowtile as rt
+
+    width = x.element_size() * 8
+    vec = math.gcd(N, 128 // width)
+    tpr = max(WARP, rt.row_config(N, width, 1).tpr)
+    return -(-N // (tpr * vec)) <= _ONESHOT_MAX_LOADS
+
+
+def _try_fast_row(trait, trait_key, x, out_dtypes, nouts):
+    # Fast path for the CONTIGUOUS last dim of a 2D problem; None if it is not handled. The
+    # one-shot needs no index remap, so it serves index traits directly, while the cross-CTA
+    # split declines them -- its reshape makes a sub-row's chunk index row % C, which is awkward
+    # to rebase to a global column (see kernel_xcta's has_index gate).
+    if x.dim() != 2 or x.stride(-1) != 1:
+        return None
+    N = x.shape[-1]
+    if N < 1:
+        return None
+    if nouts not in (1, 2) or not _oneshot_ok(x):
+        return None
+    from . import kernel_rowtile as rt
+
+    return rt.reduce_row_tile(trait, trait_key, x, out_dtypes, nouts=nouts)
 
 
 def _as_shape(out, out_shape):
@@ -436,6 +476,20 @@ def _reduce(trait, trait_key, x, dims, out_dtypes, nouts, block=_K0_BLOCK):
     if math.prod(out_shape) == 1 and nouts == 1 and x.is_contiguous():
         out = reduce_all(trait, trait_key, x, out_dtypes[0], block=block)
         return (_as_shape(out, out_shape),)
+
+    # Classify the POST-TI-coalesce geometry and reshape onto a fast kernel, which is what puts a
+    # contiguous n-D reduction over its innermost axes on the row/col path. The general kernel
+    # stays the correctness fallback for direct callers and for a fast kernel that declines.
+    if len(out_shape) > 0 and x.is_contiguous():
+        red_pairs, kept_pairs = _ti_pairs(x, _probe(x, red_axes))
+        has_index = getattr(trait, "has_index", False)
+        kind = fast_kind(red_pairs, kept_pairs, nouts, has_index)
+        red_n = x.numel() // max(1, math.prod(out_shape))
+        if kind == "row":
+            x2 = x.reshape(math.prod(out_shape), red_n)
+            fast = _try_fast_row(trait, trait_key, x2, out_dtypes, nouts)
+            if fast is not None:
+                return tuple(o.reshape(out_shape) for o in fast)
 
     outs = [torch.empty(out_shape, device=x.device, dtype=d) for d in out_dtypes]
     num_o = max(1, math.prod(out_shape))  # blocks (kept coordinates)
@@ -474,16 +528,23 @@ def _grid_size(L, block, sm_count, grid_mult=4):
 def reduce_all(
     trait, trait_key, x, out_dtype, block=_K0_ALL_BLOCK, grid_mult=_K0_ALL_GRID_MULT
 ):
-    # Full-tensor reduce-all via the two-stage split: stage 1 grid-strides the flat input into G
-    # chunks, stage 2 folds them and projects once. Mirrors ATen's ctas_per_output and needs no
-    # reshape, so it serves any element count. Index traits are served too, since a single row
-    # makes the flat offset the column.
+    # Full-tensor reduce-all. A tensor that fits the one-shot's tile goes to the row kernel, whose
+    # single-row config widens the row-packing tpr -- otherwise the launch runs a fraction of one
+    # CTA. Otherwise the two-stage split, which needs no reshape and so serves any element count.
     if not (x.is_cuda and x.is_contiguous()):
         raise AssertionError(
             f"reduce-all needs a contiguous CUDA input, got {x.device} {x.stride()}"
         )
     L = x.numel()
     xf = x.reshape(-1)
+    x2 = xf.view(1, -1)
+    if _oneshot_ok(x2):
+        from . import kernel_rowtile as rt
+
+        cfg = rt.single_row_config(L, x.element_size() * 8, trait.nfields)
+        kw = {} if cfg is None else {"tpr": cfg.tpr, "nt": cfg.nt}
+        (out,) = rt.reduce_row_tile(trait, trait_key, x2, [out_dtype], **kw)
+        return _as_shape(out, ())
     sm = torch.cuda.get_device_properties(x.device).multi_processor_count
     G = _grid_size(L, block, sm, grid_mult)
     chunk = (L + G - 1) // G

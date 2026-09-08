@@ -35,12 +35,20 @@ def _pos_id(acc):
     # The value that loses every max: +inf for floats, the max representable for integers, which
     # have no .inf. Wrapped in `acc(...)` so it carries the accumulator dtype -- a bare Python
     # number is treated as Float32 and breaks the ifexp type-match for fp64.
+    if acc is Int32:
+        return acc(_INT32_MAX)
+    if acc is Int64:
+        return acc(_INT64_MAX)
     return acc(acc.inf)
 
 
 def _neg_id(acc):
-    # "Smallest" identity for a max-reduction's init. -inf for floats; typed via
-    # `acc(...)` for the same reason as `_pos_id`.
+    # "Smallest" identity for a max-reduction's init: -inf for floats, the min
+    # representable value for integer accumulators; typed via `acc(...)` as above.
+    if acc is Int32:
+        return acc(-_INT32_MAX - 1)
+    if acc is Int64:
+        return acc(-_INT64_MAX - 1)
     return acc(-acc.inf)
 
 
@@ -687,22 +695,33 @@ class AMinOps:
         return acc[0]
 
 
-def _offsets(threads_per_row):
+def _offsets(threads_per_row, ascending: bool = False):
     # Decreasing butterfly offsets match PyTorch/Triton; ASCENDING is ATen's, which the tile
     # datapath's lane merge uses. Same result, different add order, so the direction is part of a
     # kernel's numerics contract.
     n = min(threads_per_row, WARP)
     offs = []
-    o = n // 2
-    while o > 0:
-        offs.append(o)
-        o = o // 2
+    if ascending:
+        o = 1
+        while o < n:
+            offs.append(o)
+            o = o * 2
+    else:
+        o = n // 2
+        while o > 0:
+            offs.append(o)
+            o = o // 2
     return offs
 
 
 @cute.jit
-def warp_reduce(trait, acc, threads_per_row: cutlass.Constexpr):
-    for offset in _offsets(threads_per_row):
+def warp_reduce(
+    trait,
+    acc,
+    threads_per_row: cutlass.Constexpr,
+    ascending: cutlass.Constexpr = False,
+):
+    for offset in _offsets(threads_per_row, ascending):
         acc = trait.combine(acc, trait.shfl_down(acc, offset))
     return acc
 
