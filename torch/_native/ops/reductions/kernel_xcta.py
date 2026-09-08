@@ -113,25 +113,42 @@ class FusedTwoStage:
         # kernel. No TMA atom: a sub-row here is wide enough that the direct load already coalesces.
         # The other axes' args are None, since an unused Int32 param is not free. ---
         s1.kernel(
-            [mX], parts, None, s1_nchunks, s1_nwaves, project_n, None, None
+            [mX],
+            parts,
+            None,
+            s1_nchunks,
+            s1_nwaves,
+            project_n,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ).launch(
             grid=[cute.ceil_div(mX.shape[0], const_expr(s1.rows_per_block)), 1, 1],
             block=[const_expr(s1.nt), 1, 1],
             stream=stream,
         )
-        # --- stage 2: one block per output row, with the grid read live so the fused kernel serves any
-        # M. A single kept dim means the decode ignores the extent, and the geometry arrives as RUNTIME
-        # args, so one kernel serves every N in the vec class with its own C. ---
+        # --- stage 2: the general axis, one block per output row, with the grid read live so the
+        # fused kernel serves any M. A single kept dim means the decode ignores the extent, so M stays
+        # dynamic, and the geometry arrives as runtime args. ---
         s2 = self.s2
-        s2.kernel(
+        # Argument order is the shared body's; the row/col axes' args are None (an unused
+        # Int32 param is not free -- see tile.TileReduce.kernel).
+        s2.tile.kernel(
             parts,
             mOuts,
+            None,
+            count,
+            None,
+            project_n,
+            None,
+            None,
             rvals,
             kvals,
-            count,
             cutlass.Int64(0),
             cutlass.Int64(count),
-            project_n,
         ).launch(grid=[mOuts[0].shape[0], 1, 1], block=[s2.block, 1, 1], stream=stream)
 
 

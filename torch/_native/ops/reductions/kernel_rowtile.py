@@ -187,6 +187,10 @@ def reduce_row_tile(
             nchunks,
             nwaves,
             Int32(N),
+            None,  # q, npar: the col axis's split
+            None,
+            None,  # rvals, kvals, in_base, limit: the general axis's decode
+            None,
             None,
             None,
             _stream(),
@@ -197,5 +201,18 @@ def reduce_row_tile(
     fn = cached_plan(_CACHE, key, build, op=f"aten::{trait_key}")
     # The real operands: read_only on the INPUT, or a COW input materializes on export. The other
     # axes' args are None rather than dummies -- an unused Int32 param costs real time.
-    fn([_L.read_only(x)], list(outs), nchunks, nwaves, Int32(N), None, None, _stream())
+    fn(
+        [_L.read_only(x)],
+        list(outs),
+        nchunks,
+        nwaves,
+        Int32(N),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        _stream(),
+    )
     return tuple(outs)
