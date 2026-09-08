@@ -2499,19 +2499,24 @@ class TestFlexFlash(InductorTestCase):
         grads_triton = run_backend("TRITON", q_triton, k_triton, v_triton)
 
         q_ref, k_ref, v_ref = [t.detach().float().requires_grad_() for t in (q, k, v)]
-        out_ref, lse_ref = flex_attention(
-            q_ref,
-            k_ref,
-            v_ref,
-            score_mod=_times_two,
-            scale=1.0,
-            return_lse=True,
-        )
-        grads_ref = torch.autograd.grad(
-            (out_ref, lse_ref),
-            (q_ref, k_ref, v_ref),
-            (grad_out.float(), grad_lse),
-        )
+        prior_fp32_precision = torch.backends.cuda.matmul.fp32_precision
+        try:
+            torch.backends.cuda.matmul.fp32_precision = "ieee"
+            out_ref, lse_ref = flex_attention(
+                q_ref,
+                k_ref,
+                v_ref,
+                score_mod=_times_two,
+                scale=1.0,
+                return_lse=True,
+            )
+            grads_ref = torch.autograd.grad(
+                (out_ref, lse_ref),
+                (q_ref, k_ref, v_ref),
+                (grad_out.float(), grad_lse),
+            )
+        finally:
+            torch.backends.cuda.matmul.fp32_precision = prior_fp32_precision
 
         for grad_flash, grad_triton, grad_ref in zip(
             grads_flash, grads_triton, grads_ref
