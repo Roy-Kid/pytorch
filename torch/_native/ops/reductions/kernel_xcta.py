@@ -24,6 +24,7 @@ from .._cutedsl.plan_cache import cached_plan
 from . import (  # safe: kernel_general imports us only lazily
     kernel_general as _RB,
     kernel_rowtile as _rt,
+    tile,
 )
 
 
@@ -107,11 +108,11 @@ class FusedTwoStage:
         stream: cuda.CUstream,
     ):
         s1 = self.s1
-        # --- stage 1 launch (mirrors RowTile.__call__) ---
-        # The tile row kernel with final=False: it writes the RAW per-field accumulator of
-        # each sub-row. Its fold is ROLLED, so the sub-row length arrives as runtime args
-        # (nchunks/nwaves) and distinct N in a vec class share ONE compiled kernel.
-        s1.kernel(mX, parts, s1_nchunks, s1_nwaves, project_n).launch(
+        # --- stage 1: the row kernel with final=False, writing each sub-row's RAW accumulator. Its
+        # fold is ROLLED, so the sub-row length arrives as runtime args and a vec class shares one
+        # kernel. No TMA atom: a sub-row here is wide enough that the direct load already coalesces.
+        # The other axes' args are None, since an unused Int32 param is not free. ---
+        s1.kernel([mX], parts, s1_nchunks, s1_nwaves, project_n, None, None).launch(
             grid=[cute.ceil_div(mX.shape[0], const_expr(s1.rows_per_block)), 1, 1],
             block=[const_expr(s1.nt), 1, 1],
             stream=stream,
@@ -265,7 +266,17 @@ def _build_geom(trait, trait_key, x, out_dtypes, nouts, M, N, block, subrow_targ
     s1_counts = (Int32(s // svec), Int32(-(-(s // svec) // tpr)))
 
     def _make_s1():
-        return _rt.RowTile(trait, torch2cute[x.dtype], s, tpr, nt, nouts, False, unroll)
+        return tile.TileReduce(
+            trait,
+            torch2cute[x.dtype],
+            "row",
+            s,
+            tpr=tpr,
+            nt=nt,
+            nouts=nouts,
+            final=False,
+            unroll=unroll,
+        )
 
     def _fake_in():
         # 2D row-major, both extents dynamic: mode 1 divisible by the sub-row vec width, so one
