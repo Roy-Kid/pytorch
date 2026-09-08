@@ -1,0 +1,829 @@
+# CuTeDSL trait library for native reductions: the trait protocol plus the cross-thread reduce
+# helpers. Under _cutedsl/ so pointwise ops can reuse it.
+#
+# THREE value methods, and the split is what lets any trait ride any fold order: `leaf` makes
+# one element a standalone accumulator, `combine` merges two associatively, and `reduce` is the
+# serial update, which may use a cheaper online formula. A tree fold cannot use `reduce`, so
+# anything that TRANSFORMS an element must say so in `leaf` or a tree silently folds raw
+# values. reduce/combine/project are ATen's own names (SharedReduceOps.h); `leaf` is the
+# addition a tree needs, since ATen folds serially from an identity and can hide the transform.
+#
+# The ACCUMULATOR DTYPE is a parameter, with identities taken from the dtype so they are right
+# for any acc type. Two DSL idioms this file rests on: a scalar select only lowers inside a
+# @cute.jit body, which is why every value method is decorated; and cute.arch.fmax is NaN-
+# SUPPRESSING, so NaN handling is always explicit via x != x.
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Boolean, const_expr, Float32, Int32, Int64
+
+
+WARP = 32
+
+# argmax/argmin "no winner yet" sentinel, per index dtype. Int32 by default, since an index is
+# a position and the narrow field halves partial traffic; Int64 only when the extent can
+# exceed the Int32 range.
+_INT32_MAX = (1 << 31) - 1
+_INT64_MAX = (1 << 63) - 1
+
+
+def _idx_sentinel(idx_dtype):
+    return idx_dtype(_INT64_MAX if idx_dtype is Int64 else _INT32_MAX)
+
+
+def _pos_id(acc):
+    # The value that loses every max: +inf for floats, the max representable for integers, which
+    # have no .inf. Wrapped in `acc(...)` so it carries the accumulator dtype -- a bare Python
+    # number is treated as Float32 and breaks the ifexp type-match for fp64.
+    return acc(acc.inf)
+
+
+def _neg_id(acc):
+    # "Smallest" identity for a max-reduction's init. -inf for floats; typed via
+    # `acc(...)` for the same reason as `_pos_id`.
+    return acc(-acc.inf)
+
+
+class SumOps:
+    # acc = (sum,). Validates vs torch.sum(x, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(0.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the element itself.
+        return (self.acc(val),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        add = val if valid else self.acc(0.0)
+        return (acc[0] + add,)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (a[0] + b[0],)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class NormOps:
+    # acc = (sum of |x|**p,). project = sum**(1/p).
+    # Validates vs torch.linalg.vector_norm(x, ord=p, dim=-1).
+    nfields = 1
+
+    def __init__(self, p, acc=Float32):
+        self.p = float(p)
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    @cute.jit
+    def _absp(self, val):
+        a = self.acc(cute.math.absf(val))
+        if const_expr(self.p == 1.0):
+            return a
+        elif const_expr(self.p == 2.0):
+            return a * a
+        else:
+            # |x|**p via exp(p*log|x|); log(0)=-inf so 0**p -> exp(-inf)=0 for p>0.
+            return cute.math.exp(self.acc(self.p) * cute.math.log(a))
+
+    def init(self):
+        return (self.acc(0.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: |x|**p.
+        return (self._absp(val),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        contrib = self._absp(val) if valid else self.acc(0.0)
+        return (acc[0] + contrib,)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (a[0] + b[0],)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        s = acc[0]
+        if const_expr(self.p == 1.0):
+            return s
+        elif const_expr(self.p == 2.0):
+            return cute.math.sqrt(s)
+        else:
+            return cute.math.exp(cute.math.log(s) / self.acc(self.p))
+
+
+@cute.jit
+def _welford_denom(acc_dtype, nf, correction):
+    # var/std divisor, CLAMPED AT ZERO like aten: `correction >= n` must divide by 0, giving the
+    # +inf ATen returns, not by a negative number, which returned a NEGATIVE variance. `nf` is a
+    # runtime value, so this is a select rather than a python max().
+    d = nf - acc_dtype(correction)
+    z = acc_dtype(0.0)
+    return d if d > z else z  # noqa: FURB136 -- see the note above _maxnan
+
+
+class WelfordOps:
+    # acc = (mean, m2, nf). `reduce` is the ONLINE Welford update and `combine` the PARALLEL Chan
+    # merge -- deliberately different formulas. project divides m2 by the clamped dof.
+    nfields = 3
+
+    def __init__(self, correction=1, take_sqrt=False, return_mean=False, acc=Float32):
+        self.correction = float(correction)
+        self.take_sqrt = bool(take_sqrt)
+        self.return_mean = bool(return_mean)
+        self.acc = acc
+        self.fdtypes = (acc, acc, acc)
+
+    def init(self):
+        z = self.acc(0.0)
+        return (z, z, z)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: a one-element accumulator (mean = x, m2 = 0, count = 1).
+        return (self.acc(val), self.acc(0.0), self.acc(1.0))
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        mean, m2, nf = acc
+        new_nf = nf + self.acc(1.0)
+        delta = val - mean
+        new_mean = mean + delta / new_nf
+        new_m2 = m2 + delta * (val - new_mean)
+        # OOB element: keep accumulator unchanged (do not advance the count).
+        out_mean = new_mean if valid else mean
+        out_m2 = new_m2 if valid else m2
+        out_nf = new_nf if valid else nf
+        return (out_mean, out_m2, out_nf)
+
+    @cute.jit
+    def combine(self, a, b):
+        ma, m2a, na = a
+        mb, m2b, nb = b
+        nn = na + nb
+        nb_over_n = (nb / nn) if (nn > self.acc(0.0)) else self.acc(0.0)
+        delta = mb - ma
+        mean = ma + delta * nb_over_n
+        m2 = m2a + m2b + delta * delta * na * nb_over_n
+        return (mean, m2, nn)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (
+            cute.arch.shuffle_sync_bfly(acc[0], offset=offset),
+            cute.arch.shuffle_sync_bfly(acc[1], offset=offset),
+            cute.arch.shuffle_sync_bfly(acc[2], offset=offset),
+        )
+
+    @cute.jit
+    def project(self, acc, n):
+        mean, m2, nf = acc
+        if const_expr(self.return_mean):
+            return mean
+        var = m2 / _welford_denom(self.acc, nf, self.correction)
+        if const_expr(self.take_sqrt):
+            return cute.math.sqrt(var)
+        return var
+
+
+class ArgMaxOps:
+    # acc = (best value, best index). NaN beats everything, an exact tie goes to the LOWER index,
+    # otherwise the larger value wins -- torch.argmax's first-NaN, first-max rule. The index dtype
+    # is Int32 by default and Int64 when the extent can exceed 2**31, which is what lets the
+    # cross-CTA split serve huge-N argmax.
+    nfields = 2
+    has_index = True
+
+    def __init__(self, acc=Float32, idx=Int32):
+        self.acc = acc
+        self.idx = idx
+        self.fdtypes = (acc, idx)
+
+    def init(self):
+        return (_neg_id(self.acc), _idx_sentinel(self.idx))
+
+    @cute.jit
+    def _pick(self, bv, bi, cv, ci):
+        # Does candidate (cv, ci) beat current best (bv, bi)?
+        cand_nan = cv != cv
+        best_nan = bv != bv
+        repl = (
+            ((ci < bi) if best_nan else Boolean(True))
+            if cand_nan
+            else (
+                Boolean(False) if best_nan else ((ci < bi) if (cv == bv) else (cv > bv))
+            )
+        )
+        nv = cv if repl else bv
+        ni = ci if repl else bi
+        return (nv, ni)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the (value, position) pair; `combine` does the picking.
+        return (self.acc(val), self.idx(idx))
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        nv, ni = self._pick(acc[0], acc[1], val, self.idx(idx))
+        out_v = nv if valid else acc[0]
+        out_i = ni if valid else acc[1]
+        return (out_v, out_i)
+
+    @cute.jit
+    def combine(self, a, b):
+        return self._pick(a[0], a[1], b[0], b[1])
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (
+            cute.arch.shuffle_sync_bfly(acc[0], offset=offset),
+            cute.arch.shuffle_sync_bfly(acc[1], offset=offset),
+        )
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[1]
+
+
+class ProdOps:
+    # acc = (product,). Validates vs torch.prod(x, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(1.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the element itself.
+        return (self.acc(val),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        mul = val if valid else self.acc(1.0)
+        return (acc[0] * mul,)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (a[0] * b[0],)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class MeanOps:
+    # acc = (sum,); factor applied in project. Validates vs torch.mean(x, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(0.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the element itself.
+        return (self.acc(val),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        add = val if valid else self.acc(0.0)
+        return (acc[0] + add,)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (a[0] + b[0],)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0] / n
+
+
+class NanSumOps:
+    # acc = (sum,); NaN inputs map to 0. Validates vs torch.nansum(x, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(0.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: 0 for a NaN, the element otherwise.
+        return (self.acc(val) if (val == val) else self.acc(0.0),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        clean = val if (val == val) else self.acc(0.0)
+        add = clean if valid else self.acc(0.0)
+        return (acc[0] + add,)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (a[0] + b[0],)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class AllOps:
+    # acc = (1.0 while all-true,). x != 0 is True (NaN is truthy, matches torch).
+    # AND via product of 0/1 flags. Validates vs torch.all(x, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(1.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the 0/1 truth flag.
+        return (self.acc(1.0) if (val != self.acc(0.0)) else self.acc(0.0),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        flag = self.acc(1.0) if (val != self.acc(0.0)) else self.acc(0.0)
+        keep = flag if valid else self.acc(1.0)
+        return (acc[0] * keep,)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (a[0] * b[0],)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class AnyOps:
+    # acc = (1.0 if any-true,). OR via max of 0/1 flags. Validates vs torch.any.
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(0.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the 0/1 truth flag.
+        return (self.acc(1.0) if (val != self.acc(0.0)) else self.acc(0.0),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        flag = self.acc(1.0) if (val != self.acc(0.0)) else self.acc(0.0)
+        keep = flag if valid else self.acc(0.0)
+        return (max(keep, acc[0]),)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (max(b[0], a[0]),)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class CountNonzeroOps:
+    # acc = (count,). Also serves p=0 norm. Validates vs torch.count_nonzero and
+    # torch.linalg.vector_norm(x, ord=0, dim=-1). NaN counts as nonzero.
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(0.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the 0/1 truth flag.
+        return (self.acc(1.0) if (val != self.acc(0.0)) else self.acc(0.0),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        flag = self.acc(1.0) if (val != self.acc(0.0)) else self.acc(0.0)
+        add = flag if valid else self.acc(0.0)
+        return (acc[0] + add,)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (a[0] + b[0],)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class AbsMaxOps:
+    # acc = (max|x|,). p=inf norm. Validates vs vector_norm(x, ord=inf, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (self.acc(0.0),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: |x|.
+        return (self.acc(cute.math.absf(val)),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        a = self.acc(cute.math.absf(val))
+        m = max(acc[0], a)
+        return (m if valid else acc[0],)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (max(b[0], a[0]),)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class AbsMinOps:
+    # acc = (min|x|,). p=-inf norm. Validates vs vector_norm(x, ord=-inf, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (_pos_id(self.acc),)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: |x|.
+        return (self.acc(cute.math.absf(val)),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        a = self.acc(cute.math.absf(val))
+        m = min(acc[0], a)
+        return (m if valid else acc[0],)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (min(b[0], a[0]),)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class ArgMinOps:
+    # acc = (best_val, best_idx). LessOrNan: NaN beats everything; tie -> lower
+    # index; else smaller value wins. Matches torch.argmin.
+    nfields = 2
+    has_index = (
+        True  # index dtype parametric (Int32 default / Int64 huge-N); see ArgMaxOps
+    )
+
+    def __init__(self, acc=Float32, idx=Int32):
+        self.acc = acc
+        self.idx = idx
+        self.fdtypes = (acc, idx)
+
+    def init(self):
+        return (_pos_id(self.acc), _idx_sentinel(self.idx))
+
+    @cute.jit
+    def _pick(self, bv, bi, cv, ci):
+        cand_nan = cv != cv
+        best_nan = bv != bv
+        repl = (
+            ((ci < bi) if best_nan else Boolean(True))
+            if cand_nan
+            else (
+                Boolean(False) if best_nan else ((ci < bi) if (cv == bv) else (cv < bv))
+            )
+        )
+        nv = cv if repl else bv
+        ni = ci if repl else bi
+        return (nv, ni)
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the (value, position) pair; `combine` does the picking.
+        return (self.acc(val), self.idx(idx))
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        nv, ni = self._pick(acc[0], acc[1], val, self.idx(idx))
+        out_v = nv if valid else acc[0]
+        out_i = ni if valid else acc[1]
+        return (out_v, out_i)
+
+    @cute.jit
+    def combine(self, a, b):
+        return self._pick(a[0], a[1], b[0], b[1])
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (
+            cute.arch.shuffle_sync_bfly(acc[0], offset=offset),
+            cute.arch.shuffle_sync_bfly(acc[1], offset=offset),
+        )
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[1]
+
+
+class AMaxOps:
+    # acc = (max,). Single-field on purpose: amax returns only the value, so keeping it 1-field
+    # rather than subclassing the argmax trait halves the shuffle and smem traffic and, by not
+    # being has_index, lets the dispatcher take the cross-CTA fast path at huge N.
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (_neg_id(self.acc),)
+
+    @cute.jit
+    def _maxnan(self, a, b):
+        # NaN-propagating max, spelled out rather than `max(a, b)`: a FURB136 autofix rewrote one such
+        # ternary into the builtin and changed the emitted bits. What the builtin lowers to over these
+        # accumulators is not evident from the source, so the shapes that do use it are pinned by a
+        # test rather than by argument.
+        return b if ((b > a) or (b != b)) else a
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the element itself.
+        return (self.acc(val),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        m = self._maxnan(acc[0], val)
+        return (m if valid else acc[0],)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (self._maxnan(a[0], b[0]),)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+class AMinOps:
+    # acc = (min,). Pure single-field NaN-propagating min (the AMaxOps mirror).
+    # Validates vs torch.amin(x, dim=-1).
+    nfields = 1
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc,)
+
+    def init(self):
+        return (_pos_id(self.acc),)
+
+    @cute.jit
+    def _minnan(self, a, b):
+        return b if ((b < a) or (b != b)) else a
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the element itself.
+        return (self.acc(val),)
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        m = self._minnan(acc[0], val)
+        return (m if valid else acc[0],)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (self._minnan(a[0], b[0]),)
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (cute.arch.shuffle_sync_bfly(acc[0], offset=offset),)
+
+    @cute.jit
+    def project(self, acc, n):
+        return acc[0]
+
+
+def _offsets(threads_per_row):
+    # Decreasing butterfly offsets match PyTorch/Triton; ASCENDING is ATen's, which the tile
+    # datapath's lane merge uses. Same result, different add order, so the direction is part of a
+    # kernel's numerics contract.
+    n = min(threads_per_row, WARP)
+    offs = []
+    o = n // 2
+    while o > 0:
+        offs.append(o)
+        o = o // 2
+    return offs
+
+
+@cute.jit
+def warp_reduce(trait, acc, threads_per_row: cutlass.Constexpr):
+    for offset in _offsets(threads_per_row):
+        acc = trait.combine(acc, trait.shfl_down(acc, offset))
+    return acc
+
+
+@cute.jit
+def block_reduce(
+    trait,
+    acc,
+    bufs,
+    warps_per_row: cutlass.Constexpr,
+    rows_per_block: cutlass.Constexpr = 1,
+):
+    # Cross-warp reduction WITHIN each row's warp group: a block may hold several rows, each
+    # spanning several warps, and each row must reduce its own group -- mixing them (the old flat
+    # version) corrupted multi-row blocks.
+    lane = cute.arch.lane_idx()
+    warp = cute.arch.warp_idx()
+    row_g = warp // warps_per_row
+    col_g = warp % warps_per_row
+    if lane == 0:
+        for f in cutlass.range_constexpr(trait.nfields):
+            bufs[f][row_g * const_expr(warps_per_row) + col_g] = acc[f]
+    cute.arch.barrier()
+    # Every warp re-loads its OWN row's group (so all lanes of all warps get the
+    # reduced value, matching the broadcast the row kernel's lane-0 store expects).
+    out = trait.init()
+    if lane < warps_per_row:
+        out = tuple(
+            bufs[f][row_g * const_expr(warps_per_row) + lane]
+            for f in range(trait.nfields)
+        )
+    out = warp_reduce(trait, out, warps_per_row)
+    return out
+
+
+# --- Two-output traits. They reuse the single-output accumulators above and only change
+# project() to return a tuple; nouts tells the kernel how many outputs to store. ---
+
+
+class VarMeanOps(WelfordOps):
+    # Reuse the Welford accumulator and project BOTH the variance/std and the mean. correction and
+    # take_sqrt behave as in the base.
+    nouts = 2
+
+    def __init__(self, correction=1, take_sqrt=False, acc=Float32):
+        super().__init__(correction=correction, take_sqrt=take_sqrt, acc=acc)
+
+    @cute.jit
+    def project(self, acc, n):
+        mean, m2, nf = acc
+        var = m2 / _welford_denom(self.acc, nf, self.correction)
+        result = cute.math.sqrt(var) if const_expr(self.take_sqrt) else var
+        return (result, mean)
+
+
+class MaxDimOps(ArgMaxOps):
+    # Reuse the GreaterOrNan winner logic (NaN propagates, lowest index on tie);
+    # project BOTH the winning value and its index. Validates vs torch.max(dim).
+    nouts = 2
+
+    @cute.jit
+    def project(self, acc, n):
+        return (acc[0], acc[1])
+
+
+class MinDimOps(ArgMinOps):
+    # LessOrNan winner; project (value, index). Validates vs torch.min(dim).
+    nouts = 2
+
+    @cute.jit
+    def project(self, acc, n):
+        return (acc[0], acc[1])
+
+
+class AMinMaxOps:
+    # acc = (min, max), tracking both extremes and projecting the pair. NaN-propagating like
+    # torch.aminmax: any NaN in the row makes both outputs NaN.
+    nfields = 2
+    nouts = 2
+
+    def __init__(self, acc=Float32):
+        self.acc = acc
+        self.fdtypes = (acc, acc)
+
+    def init(self):
+        return (_pos_id(self.acc), _neg_id(self.acc))
+
+    @cute.jit
+    def _fmin(self, a, b):
+        # NaN-propagating min, as an explicit truth table because that is the property being relied
+        # on. See AMaxOps._maxnan for why these are not the builtins.
+        return (a if a != a else (a if a < b else b)) if b == b else b  # noqa: FURB136
+
+    @cute.jit
+    def _fmax(self, a, b):
+        return (a if a != a else (a if a > b else b)) if b == b else b  # noqa: FURB136
+
+    @cute.jit
+    def leaf(self, val, idx):
+        # This element's contribution as a standalone accumulator: the element as both extremes.
+        return (self.acc(val), self.acc(val))
+
+    @cute.jit
+    def reduce(self, acc, val, idx, valid):
+        lo = self._fmin(acc[0], val)
+        hi = self._fmax(acc[1], val)
+        out_lo = lo if valid else acc[0]
+        out_hi = hi if valid else acc[1]
+        return (out_lo, out_hi)
+
+    @cute.jit
+    def combine(self, a, b):
+        return (self._fmin(a[0], b[0]), self._fmax(a[1], b[1]))
+
+    @cute.jit
+    def shfl_down(self, acc, offset):
+        return (
+            cute.arch.shuffle_sync_bfly(acc[0], offset=offset),
+            cute.arch.shuffle_sync_bfly(acc[1], offset=offset),
+        )
+
+    @cute.jit
+    def project(self, acc, n):
+        return (acc[0], acc[1])
