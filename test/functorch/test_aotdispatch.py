@@ -12770,7 +12770,9 @@ instantiate_device_type_tests(
 )
 
 instantiate_parametrized_tests(TestAOTModuleSimplified)
-instantiate_device_type_tests(TestAOTModuleSimplifiedDevice, globals(), only_for=("cuda",))
+instantiate_device_type_tests(
+    TestAOTModuleSimplifiedDevice, globals(), only_for=("cuda", "xpu"), allow_xpu=True
+)
 
 only_for = "cpu"
 instantiate_device_type_tests(TestEagerFusionOpInfo, globals(), only_for=only_for)
