@@ -35,6 +35,7 @@ from .immutable_collections import immutable_dict
 from .node import (
     _device_annotation,
     _get_qualified_name,
+    _SPARSE_LAYOUTS,
     _type_repr,
     Argument,
     Node,
@@ -803,7 +804,8 @@ class CodeGen:
                 )
 
                 def _tensor_annotation(t: torch.Tensor) -> str:
-                    stride = stringify_shape(t.stride()) if include_stride else ""
+                    want_stride = include_stride and t.layout not in _SPARSE_LAYOUTS
+                    stride = stringify_shape(t.stride()) if want_stride else ""
                     device = _device_annotation(t.device) if include_device else ""
                     return (
                         f"{red(dtype_abbrs[t.dtype])}"
@@ -813,10 +815,7 @@ class CodeGen:
                     )
 
                 # use string as annotation, to make it valid python code
-                if isinstance(meta_val, torch.Tensor) and meta_val.layout not in (
-                    torch.sparse_csc,
-                    torch.sparse_csr,
-                ):
+                if isinstance(meta_val, torch.Tensor):
                     # Fake tensors cause tests to wobble, so do not custom print them.
                     is_plain = type(meta_val) is torch.Tensor or isinstance(
                         meta_val, torch._subclasses.FakeTensor

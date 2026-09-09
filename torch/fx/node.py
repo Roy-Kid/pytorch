@@ -47,6 +47,14 @@ BaseArgumentTypes = Union[  # noqa: UP007
 ]
 base_types = typing.get_args(BaseArgumentTypes)
 
+_SPARSE_LAYOUTS = (
+    torch.sparse_coo,
+    torch.sparse_csc,
+    torch.sparse_csr,
+    torch.sparse_bsc,
+    torch.sparse_bsr,
+)
+
 Target: TypeAlias = Callable[..., Any] | str
 
 Argument = Optional[  # noqa: UP045
@@ -686,16 +694,12 @@ class Node(_NodeBase):
                 self.meta.get("tensor_meta", self.meta.get("example_value", None)),
             )
             type_annotation = ""
-            if (
-                include_tensor_metadata
-                and isinstance(meta_val, torch.Tensor)
-                and meta_val.layout
-                not in (
-                    torch.sparse_csc,
-                    torch.sparse_csr,
+            if include_tensor_metadata and isinstance(meta_val, torch.Tensor):
+                stride_annotation = (
+                    ""
+                    if meta_val.layout in _SPARSE_LAYOUTS
+                    else stringify_shape(meta_val.stride())
                 )
-            ):
-                stride_annotation = f"{stringify_shape(meta_val.stride())}"
                 device_annotation = _device_annotation(meta_val.device)
                 type_annotation = (
                     f'Tensor "{dtype_abbrs[meta_val.dtype]}{stringify_shape(meta_val.shape)}'
