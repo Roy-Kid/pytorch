@@ -3314,6 +3314,113 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     )
     transpose_discontiguous_tensor_descriptors_override: bool | None = None
 
+    def finalize_indexing(self, indices: Sequence[sympy.Expr]) -> None:
+        super().finalize_indexing(indices)
+        self._eliminated_reduction_numel_symbols_for_indexing.clear()
+        # Staged reductions emit some indexing outside this prepass, so their
+        # complete scalar-argument liveness is not available here.
+        if self.features.indexing_node_schedule is not self.features.node_schedule:
+            return
+
+        allowed_symbol_types = (
+            SymT.SIZE,
+            SymT.UNBACKED_INT,
+            SymT.PRECOMPUTED_SIZE,
+        )
+
+        def size_symbols(exprs: Iterable[sympy.Expr]) -> OrderedSet[sympy.Symbol]:
+            return OrderedSet(
+                symbol
+                for expr in exprs
+                for symbol in expr.free_symbols
+                if symbol_is_type(symbol, allowed_symbol_types)
+            )
+
+        all_indices = [
+            *indices,
+            *(entry.expr for entry in self.range_tree_nodes.values()),
+        ]
+        original_symbols = size_symbols(all_indices)
+        rewritten_symbols = size_symbols(
+            self._replace_reduction_numel_in_index(index, force=True)
+            for index in all_indices
+        )
+        self._eliminated_reduction_numel_symbols_for_indexing.update(
+            original_symbols - rewritten_symbols
+        )
+
+    def _replace_reduction_numel_in_index(
+        self, index: sympy.Expr, *, force: bool = False
+    ) -> sympy.Expr:
+        if not force and not self._eliminated_reduction_numel_symbols_for_indexing:
+            return index
+
+        sizevars = V.graph.sizevars
+        reduction_numels = []
+        for prefix, numel in self.numels.items():
+            if not prefix_is_reduction(prefix):
+                continue
+            numel = sizevars.simplify(sizevars.remove_precomputed_replacements(numel))
+            if numel.free_symbols:
+                reduction_numels.append(
+                    (
+                        numel,
+                        sympy.Symbol(f"{prefix}numel", integer=True, nonnegative=True),
+                    )
+                )
+
+        if not reduction_numels:
+            return index
+
+        reduction_numel_symbols = OrderedSet(symbol for _, symbol in reduction_numels)
+        allowed_symbol_types = (
+            SymT.SIZE,
+            SymT.UNBACKED_INT,
+            SymT.PRECOMPUTED_SIZE,
+        )
+
+        def replacement(candidate: sympy.Basic) -> sympy.Symbol | None:
+            if not isinstance(candidate, sympy.Expr):
+                return None
+            if candidate in reduction_numel_symbols or not candidate.free_symbols:
+                return None
+            if any(
+                not symbol_is_type(symbol, allowed_symbol_types)
+                for symbol in candidate.free_symbols
+            ):
+                return None
+            if not force and not candidate.free_symbols.intersection(
+                self._eliminated_reduction_numel_symbols_for_indexing
+            ):
+                return None
+
+            normalized_candidate = sizevars.simplify(
+                sizevars.remove_precomputed_replacements(candidate)
+            )
+            for reduction_numel, reduction_numel_symbol in reduction_numels:
+                if (
+                    normalized_candidate == reduction_numel
+                    or sizevars.statically_known_equals(
+                        normalized_candidate, reduction_numel
+                    )
+                ):
+                    return reduction_numel_symbol
+            return None
+
+        # Prefer an enclosing match over nested matches: replacing the whole
+        # expression removes a superset of its children's symbol uses.
+        replacements = {
+            candidate: replacement_symbol
+            for candidate in sympy.preorder_traversal(index)
+            if (replacement_symbol := replacement(candidate)) is not None
+        }
+        return index.xreplace(replacements)
+
+    def index_to_str(self, index: sympy.Expr) -> str:
+        if isinstance(index, sympy.Expr):
+            index = self._replace_reduction_numel_in_index(index)
+        return super().index_to_str(index)
+
     def __init__(
         self,
         tiling: dict[str, sympy.Expr],
@@ -3327,6 +3434,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         self.optimize_mask: bool = optimize_mask
         self.fixed_config = fixed_config
+        self._eliminated_reduction_numel_symbols_for_indexing: OrderedSet[
+            sympy.Symbol
+        ] = OrderedSet()
         self.is_combo_kernel: bool = is_combo_kernel
         self.per_subkernel_blocks: bool = per_subkernel_blocks
         super().__init__(tiling, **kwargs)
@@ -4551,7 +4661,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         index_str = indexing.index_str
         mask_str = indexing.mask_str if indexing.has_mask() else None
-        size_str = texpr(self.rename_indexing(size)) if upper else None
+        size_str = self.index_to_str(size) if upper else None
 
         # expr is already wrapped
         line = self.indirect_assert(
@@ -7766,7 +7876,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
             if tree.is_reduction and self.persistent_reduction:
                 if self.cooperative_reduction:
-                    numel = self.kexpr(self.rename_indexing(tree.numel))
+                    numel = self.index_to_str(tree.numel)
                     val = f"triton_helpers.constexpr_next_power_of_2(({numel} + RSPLIT - 1) // RSPLIT)"
                 else:
                     val = self._get_persistent_reduction_block(tree.numel)
@@ -7855,7 +7965,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return TritonCSEVariable(*args, **kwargs)
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry):
-        line = f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
+        line = f"{entry.name} = {self.index_to_str(entry.expr)}"
 
         # mix order reduction introduces an extra loop across the x
         # dimension

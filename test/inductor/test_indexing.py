@@ -1263,6 +1263,76 @@ class TestOptimizationHintWideUnbackedSubstitution(InductorTestCase):
 @instantiate_parametrized_tests
 class ReductionInvariantIndexingTests(InductorTestCase):
     @unittest.skipIf(not HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    def test_reuse_reduction_numel_for_indexing(self):
+        def fn(x):
+            return x.sum(dim=1)
+
+        x = torch.randn(7, 37, device=GPU_TYPE)
+        expected = fn(x)
+
+        with config.patch({"force_disable_caches": True}):
+            actual, kernels = run_and_get_kernels(
+                torch.compile(fn, fullgraph=True, dynamic=True),
+                x,
+                remove_quote=True,
+            )
+
+        self.assertEqual(expected, actual)
+        self.assertEqual(1, len(kernels))
+        FileCheck().check("r0_1 + r0_numel*x0").check_not("ks0").run(kernels[0])
+
+    @unittest.skipIf(not HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    def test_reuse_second_reduction_numel_for_indexing(self):
+        def fn(x):
+            return x.sum()
+
+        x = torch.randn(295, device=GPU_TYPE).as_strided((7, 37), (37, 2))
+        expected = fn(x)
+
+        with config.patch(
+            {
+                "force_disable_caches": True,
+                "triton.prefer_nd_tiling": True,
+                "triton.tile_reductions": True,
+            }
+        ):
+            actual, kernels = run_and_get_kernels(
+                torch.compile(fn, fullgraph=True, dynamic=True),
+                x,
+                remove_quote=True,
+            )
+
+        self.assertEqual(expected, actual)
+        self.assertEqual(1, len(kernels))
+        FileCheck().check("ks0*r1_1 + r0_0*r1_numel").check_not("ks1").run(kernels[0])
+
+    @unittest.skipIf(not HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
+    def test_reuse_reduction_numel_for_cooperative_reduction(self):
+        def fn(x):
+            return x.sum(dim=1)
+
+        x = torch.randn(64, 8193, device=GPU_TYPE)
+        expected = fn(x)
+
+        with config.patch(
+            {
+                "force_disable_caches": True,
+                "triton.cooperative_reductions": True,
+                "triton.force_cooperative_reductions": True,
+            }
+        ):
+            actual, kernels = run_and_get_kernels(
+                torch.compile(fn, fullgraph=True, dynamic=True),
+                x,
+                remove_quote=True,
+            )
+
+        # Cooperative reductions can accumulate in a different order than eager.
+        self.assertEqual(expected, actual, rtol=1e-3, atol=1e-6)
+        self.assertEqual(1, len(kernels))
+        FileCheck().check("r0_1 + r0_numel*x0").check_not("ks0").run(kernels[0])
+
+    @unittest.skipIf(not HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
     @parametrize("persistent_reductions", [False, True])
     def test_reduction_invariant_masked_index_load(self, persistent_reductions):
         def fn(index, source0, source1, value0, value1):
