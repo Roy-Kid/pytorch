@@ -382,6 +382,7 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             and (
                 inductor_meta.get("enable_experimental_large_output_outer_reductions")
                 or config.triton.enable_experimental_large_output_outer_reductions
+                or config.triton.autotune_experimental_large_output_outer_reductions
             )
             and not inductor_meta.get("deterministic")
             and not inductor_meta.get("are_deterministic_algorithms_enabled")
