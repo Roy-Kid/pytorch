@@ -1891,7 +1891,40 @@ class BuiltinVariable(BaseBuiltinVariable):
             # object.__init__ is a no-op
             return variables.ConstantVariable.create(None)
 
-        if self.fn in (set, frozenset, list, tuple):
+        if name == "__new__" and self.fn in (set, frozenset) and args and not kwargs:
+            # `args[0]` here is `cls` (e.g. from `super().__new__(cls, arg)`
+            # in a set/frozenset subclass's own __new__), not a receiver, so
+            # unlike the block below (which forwards unbound instance-method
+            # calls, e.g. `set.add(instance, x)`), it must not be forwarded to
+            # `args[0].call_method`.
+            is_exact_type = (
+                isinstance(args[0], BuiltinVariable) and args[0].fn is self.fn
+            )
+            if self.fn is set:
+                # set.__new__ (tp_new) ignores extra args -- population
+                # happens later via __init__, called separately after
+                # __new__ returns. Mirrors DictBuiltinVariable/
+                # ListBuiltinVariable's own __new__ handling.
+                if is_exact_type:
+                    return SetVariable([], mutation_type=ValueMutationNew())
+                return tx.output.side_effects.track_new_user_defined_object(
+                    self, args[0], [], tx=tx
+                )
+            else:
+                # frozenset is immutable: frozenset.__new__ (tp_new)
+                # populates contents directly from the iterable, since
+                # frozenset.__init__ is a no-op. Unlike set above, the
+                # iterable must be kept, mirroring tuple's handling above.
+                if is_exact_type:
+                    init_args = unpack_iterable(tx, args[1]) if len(args) > 1 else []
+                    return FrozensetVariable(
+                        init_args, mutation_type=ValueMutationNew()
+                    )
+                return tx.output.side_effects.track_new_user_defined_object(
+                    self, args[0], args[1:], tx=tx
+                )
+
+        if self.fn in (set, frozenset, list, tuple) and name != "__new__":
             if isinstance(args[0], variables.UserDefinedObjectVariable):
                 if args[0]._base_vt is None:
                     raise AssertionError(
