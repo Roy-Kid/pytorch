@@ -68,7 +68,7 @@ from torch.testing._internal.distributed._shard.sharded_tensor._test_st_common i
 
 
 DEVICE_TYPE = (
-    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cpu"
+    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cuda"
 )
 BACKEND = torch.distributed.get_default_backend_for_device(DEVICE_TYPE)
 
@@ -3559,11 +3559,9 @@ class TestShardedTensorSubGroupInit(TestCase):
         )
         dist.barrier(sub_pg)
 
-        # A CPU device only accepts index -1 or 0, so keep the index at 0 there.
         for r in sub_pg_ranks:
-            device_index = 0 if DEVICE_TYPE == "cpu" else r % sub_group_sz
             _parse_and_validate_remote_device(
-                sub_pg, _remote_device(f"rank:{r}/{DEVICE_TYPE}:{device_index}")
+                sub_pg, _remote_device(f"rank:{r}/{DEVICE_TYPE}:{r % sub_group_sz}")
             )
 
 

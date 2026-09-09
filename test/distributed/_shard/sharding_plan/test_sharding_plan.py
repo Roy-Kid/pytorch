@@ -32,7 +32,7 @@ if TEST_WITH_DEV_DBG_ASAN:
     sys.exit(0)
 
 DEVICE_TYPE = (
-    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cpu"
+    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cuda"
 )
 BACKEND = torch.distributed.get_default_backend_for_device(DEVICE_TYPE)
 

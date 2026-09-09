@@ -21,7 +21,7 @@ from torch.testing._internal.distributed._shard.sharded_tensor._test_st_common i
 
 
 DEVICE_TYPE = (
-    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cpu"
+    acc.type if (acc := torch.accelerator.current_accelerator(True)) else "cuda"
 )
 BACKEND = torch.distributed.get_default_backend_for_device(DEVICE_TYPE)
 
