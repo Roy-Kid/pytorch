@@ -4,7 +4,7 @@
 
 #include <ATen/mps/MPSStream.h>
 #include <c10/util/intrusive_ptr.h>
-#include <ctime>
+#include <atomic>
 #include <stack>
 
 namespace at::mps {
@@ -20,8 +20,6 @@ class MPSEvent {
   void record(bool needsLock, bool syncEvent = false);
   // makes all future work submitted to the stream wait for this event.
   bool wait(bool needsLock, bool syncEvent = false);
-  // schedules a notifyListener callback for the event.
-  bool notify(bool needsLock, MTLSharedEventNotificationBlock block);
   // checks if events are already signaled.
   bool query() const;
   // blocks the CPU thread until all the GPU work that were scheduled
@@ -34,36 +32,35 @@ class MPSEvent {
   id_t getID() const {
     return m_id;
   }
-  // returns the completion timestamp of the event
-  uint64_t getCompletionTime() const {
-    return m_completion_time;
+  bool isTimingEnabled() const {
+    return m_enable_timing;
   }
-  // if already recorded, waits for cpu_sync_cv to be signaled
-  void waitForCpuSync();
+  bool isRecorded() const {
+    return m_recorded.load();
+  }
+  // Waits for timing data from the latest recording and returns its timestamp.
+  double waitForCpuSync();
 
  private:
   id_t m_id;
-  // enables measuring the completion time of the notifyListener of this event
+  // Enables measuring the GPU completion time of this event.
   bool m_enable_timing;
+  std::atomic<bool> m_recorded{false};
   uint64_t m_signalCounter = 0;
   MPSStream* m_stream = nullptr;
   MTLSharedEvent_t m_event = nullptr;
-  MTLSharedEventListener* m_listener = nullptr;
   // used to sync the events created on this Stream with CPU
   std::mutex m_cpu_sync_mutex{};
   std::condition_variable m_cpu_sync_cv{};
-  // CondVar predicate to sync the events created on this Stream with CPU
-  bool m_cpu_sync_completed = false;
+  // Last signal value whose timing callback has completed.
+  uint64_t m_timing_completed = 0;
+  uint64_t m_timing_generation = 0;
   // used to compute elapsed time
-  uint64_t m_completion_time = 0;
+  double m_completion_time = 0.0;
 
   void recordLocked(bool syncEvent);
   bool waitLocked(bool syncEvent);
-  bool notifyLocked(MTLSharedEventNotificationBlock block);
-  void notifyCpuSync();
-  static uint64_t getTime() {
-    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-  }
+  void notifyCpuSync(uint64_t timingGeneration, double completionTime);
 };
 
 class MPSEventPool;
