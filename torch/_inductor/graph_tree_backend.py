@@ -36,6 +36,8 @@ class GraphTreeGraph(Protocol):
 class GraphTreeGraphInterface(Protocol):
     def create_graph(self) -> GraphTreeGraph: ...
 
+    def create_stream(self, device_index: int) -> torch.Stream: ...
+
     def create_pool(self) -> tuple[int, int]: ...
 
     def capture(
@@ -157,6 +159,7 @@ def clear_cublas_cache() -> None:
 
 @contextlib.contextmanager
 def clear_cublas_manager() -> Generator[None, None, None]:
+    "Context manager around clearing cublas caches that will clear on enter and exit"
     clear_cublas_cache()
     try:
         yield
@@ -177,6 +180,9 @@ def disable_conv_cache_emptying() -> Generator[None, None, None]:
 class CUDAGraphTreeGraphInterface:
     def create_graph(self) -> GraphTreeGraph:
         return torch.cuda.CUDAGraph()
+
+    def create_stream(self, device_index: int) -> torch.cuda.Stream:
+        return torch.cuda.Stream(device=device_index)
 
     def create_pool(self) -> tuple[int, int]:
         return torch.cuda.graph_pool_handle()
